@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# aware: lets a Claude Code session see its own usage and change its own model/effort.
+#
+#   aware launch [claude args]   start claude inside tmux with aware wired in (no global install needed)
+#   aware show                   latest status line (+ advisory); Claude can run this via Bash too
+#   aware switch model  <name>   type "/model <name>" into this tmux pane (applies after the current turn)
+#   aware switch effort <level>  type "/effort <level>" into this tmux pane
+#   aware compact                type "/compact" into this tmux pane (applies after the current turn)
+#   aware install | uninstall    optional: wire statusline + hook into ~/.claude/settings.json globally
+#   aware statusline | hook | mcp   (internal) called by Claude Code
+#
+# Tiers (worst signal wins): normal < lean < conserve < critical. Pace = share of a window used /
+# share of it elapsed; pace > 1 means that limit runs out before it resets.
+#
+# Env (all optional):
+#   AWARE_LEAN=50        % of 5h/7d limit for tier "lean" (also: any window with pace > 1)
+#   AWARE_WARN=80        % of 5h/7d limit for tier "conserve"
+#   AWARE_CRIT=95        % of 5h/7d limit for tier "critical"
+#   AWARE_CTX_LEAN=50    % of context window for tier "lean"
+#   AWARE_CTX_WARN=70    % of context window for tier "conserve" (and the advice to compact)
+#   AWARE_QUIET=1        hook injects only when an advisory fires
+#   AWARE_EVERY_TURN=1   hook injects on every prompt (default: only when the tier, model, effort or a 10% band changes)
+#   AWARE_ALLOW_COMPACT=0   refuse "aware compact"
+#   AWARE_MODELS="haiku sonnet opus"           models switch may select
+#   AWARE_EFFORTS="low medium high xhigh max"  effort levels switch may select
+#   AWARE_AUTOCONFIRM=1  press Enter on the "Switch model?" dialog for you (only when it names the new model)
+#   AWARE_CONFIRM_WAIT=600  seconds the auto-confirm watcher waits for that dialog
+#   AWARE_KEEP_DEFAULT=1    restore your default model in settings.json after a switch (0 = leave it)
+set -u
+
+SELF=$(readlink -f "$0")
+HERE=$(dirname "$SELF")
+DIR="${AWARE_DIR:-$HOME/.claude/aware}"
+LEAN="${AWARE_LEAN:-50}"
+WARN="${AWARE_WARN:-80}"
+CRIT="${AWARE_CRIT:-95}"
+CTX_LEAN="${AWARE_CTX_LEAN:-50}"
+CTX_WARN="${AWARE_CTX_WARN:-70}"
+MODELS="${AWARE_MODELS:-haiku sonnet opus}"
+EFFORTS="${AWARE_EFFORTS:-low medium high xhigh max}"
+SETTINGS="${AWARE_SETTINGS:-$HOME/.claude/settings.json}"
+BIN="${AWARE_BIN:-$HOME/.local/bin/aware}"
+
+command -v jq >/dev/null || { echo "aware needs jq" >&2; exit 1; }
+
+NOW="${AWARE_NOW:-$(date +%s)}"
+
+# with_limits FILE: print the session JSON. 5h/7d limits are account-wide, so until this session has
+# its own numbers (before its first response) borrow them from the freshest other session whose
+# 5h window has not reset yet; that way the very first prompt, where the goal is set, sees usage too.
+with_limits() {
+  local g
+  if jq -e '.rate_limits' "$1" >/dev/null 2>&1; then cat "$1"; return; fi
+  for g in $(ls -t "$DIR"/*.json 2>/dev/null); do
+    [ "$g" -ef "$1" ] && continue
+    jq -e --argjson now "$NOW" '.rate_limits.five_hour.resets_at > $now' "$g" >/dev/null 2>&1 || continue
+    jq -c -s '.[0] + {rate_limits: .[1].rate_limits}' "$1" "$g" && return
+  done
+  cat "$1"
+}
+
+# summarize FILE [lines|sig]
+#   lines (default): line 1 status, line 2 (only when tier != normal) "[aware] tier=..." advice.
+#   sig: one line the hook compares between prompts (tier, 10% bands, model, effort).
+summarize() {
+  with_limits "$1" | jq -r --arg mode "${2:-lines}" --arg models "$MODELS" --argjson now "$NOW" \
+        --argjson lean "$LEAN" --argjson warn "$WARN" --argjson crit "$CRIT" \
+        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" '
+    def pct:  if . == null then "?" else "\(floor)%" end;
+    def day:  strflocaltime("%a %H:%M");
+    def dec1: (. * 10 + 0.5 | floor) as $t | "\($t / 10 | floor).\($t % 10)";
+    def ktok: if . >= 1000 then "\(. / 1000 | floor)k" else "\(floor)" end;
+    # $w = window length in seconds. Pace is only shown once 10% of the window has passed and 5% is used.
+    def window($w):
+      (.used_percentage) as $u | (.resets_at) as $r
+      | (if $u == null or $r == null then null else ($now - ($r - $w)) end) as $el
+      | (if $el == null or $el < $w * 0.1 or $u < 5 then null else $u * $w / ($el * 100) end) as $p
+      | {u: $u, r: $r, p: $p,
+         out: (if $p != null and $p > 1 then $now + (100 - $u) * $el / $u else null end)};
+    def wtxt($name):
+      "\($name) \(.u | pct)"
+      + (if .r == null then "" else
+          " (resets \(.r | day)"
+          + (if .p == null then "" else ", pace \(.p | dec1)x" end)
+          + (if .out == null then "" else ", out ~\(.out | day)" end) + ")" end);
+
+    (.rate_limits.five_hour // {} | window(18000)) as $h5
+    | (.rate_limits.seven_day // {} | window(604800)) as $d7
+    | (.context_window.used_percentage) as $c
+    | ($c // 0) as $c0
+    | ([$h5.u, $d7.u] | map(. // 0) | max) as $hi
+    | ([$h5.p, $d7.p] | map(. // 0) | max) as $pace
+    | (.prompt_cache // {}) as $pc
+    | (if $pc.warm == null then null
+       elif $pc.warm == true and (($pc.expires_at // ($now + 1)) > $now) then true else false end) as $warm
+    | ($pc.recache_tokens_if_cold // .context_window.total_input_tokens) as $recache
+    | (if $hi >= $crit then "critical"
+       elif $hi >= $warn or $c0 >= $ctxwarn then "conserve"
+       elif $hi >= $lean or $c0 >= $ctxlean or $pace > 1 then "lean"
+       else "normal" end) as $tier
+    | (.model.id // .model.display_name // "?") as $model
+    | (.effort.level // "n/a") as $effort
+    | def band: if . == null then "?" else . / 10 | floor | tostring end;
+      if $mode == "sig" then
+        # empty = nothing measured yet (Claude Code runs the statusline before the first response)
+        if $h5.u == null and $d7.u == null and $c == null then ""
+        else "\($tier)|\($h5.u | band)|\($d7.u | band)|\($c | band)|\($model)|\($effort)" end
+      else
+        ([ (if ($h5.u // 0) >= $lean then "5h \($h5.u | pct)" else empty end),
+           (if ($d7.u // 0) >= $lean then "7d \($d7.u | pct)" else empty end),
+           (if ($h5.p // 0) > 1 then "5h pace \($h5.p | dec1)x, out ~\($h5.out | day)" else empty end),
+           (if ($d7.p // 0) > 1 then "7d pace \($d7.p | dec1)x, out ~\($d7.out | day)" else empty end),
+           (if $c0 >= $ctxlean then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
+        | (if $warm == false then "costs nothing extra now: the cache is cold"
+           elif $recache == 0 then "costs nothing extra now: nothing is cached yet"
+           elif $recache != null then "re-reads ~\($recache | ktok) tokens uncached"
+           else "re-reads the whole context uncached" end) as $switchcost
+        # Concrete steps (vague advice gets ignored, verified live): name the exact call when the
+        # current effort or model is above what the tier calls for.
+        | {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4} as $rank
+        | ({"lean": "high", "conserve": "medium", "critical": "low"}[$tier]) as $teff
+        | (if $teff != null and ($rank[$effort] // -1) > $rank[$teff]
+           then "call set_effort \($teff) now (currently \($effort); effort changes keep the cache)" else null end) as $effstep
+        # AWARE_MODELS is ordered cheapest to most expensive. Step down one place from the current model:
+        # at conserve only from the most expensive, at critical from anywhere above the cheapest.
+        | ($model | ascii_downcase) as $m
+        | ($models | split(" ") | map(select(length > 0))) as $ml
+        | ($ml | length) as $n
+        | ($ml | to_entries | map(select(. as $e | $m | contains($e.value))) | .[0].key) as $idx
+        | (if $idx == null or $idx == 0 then null
+           elif $tier == "critical" or ($tier == "conserve" and $idx == $n - 1) then $ml[$idx - 1] else null end) as $tmodel
+        # Delegation: the cheapest model for mechanical work, the next one up where judgment is needed.
+        | ("delegate bulk work to cheaper-model subagents (\($ml[0] // "haiku") for search, reads, summaries"
+           + (if $n > 2 then "; \($ml[1]) when judgment is needed" else "" end) + ")") as $deleg
+        | (if $tmodel == null then null
+           else "at the next natural break call set_model \($tmodel) (a switch \($switchcost))" end) as $modstep
+        | (if $tier == "lean" then
+             [$effstep, $deleg, "keep replies and tool output short"]
+           elif $tier == "conserve" then
+             [$effstep, $deleg, $modstep,
+              (if $c0 >= $ctxwarn then "call compact at the next natural break" else null end)]
+           else
+             ["finish the current step, write a short state summary, and ask the user before starting anything new", $effstep, $modstep]
+           end | map(select(. != null)) | join("; ")) as $advice
+        | (if $tier == "conserve" or $tier == "critical" then
+             " Without the aware tools, tell the user the command instead (e.g. /effort medium, /model sonnet, /compact)."
+           else "" end) as $fallback
+        | "[usage] \($h5 | wtxt("5h")) | \($d7 | wtxt("7d")) | ctx \($c | pct) | \(.model.display_name // .model.id // "?") | effort \($effort)"
+          + (if $warm == true then " | cache warm" elif $warm == false then " | cache cold" else "" end)
+          + " | $\((.cost.total_cost_usd // 0) * 100 | floor / 100)",
+          (if $tier == "normal" then empty else "[aware] tier=\($tier)\(if $why == "" then "" else " (\($why))" end): \($advice).\($fallback)" end)
+      end
+  ' 2>/dev/null
+}
+
+# keep_default KIND JQ-OBJECT: snapshot the settings.json keys a slash command is about to overwrite
+# (e.g. '{model}'), wait for them to change, then put the old values back (null = key was absent).
+# Slash commands only run once the current turn ends, so the watcher waits up to 15 minutes.
+keep_default() {
+  local pidf="$DIR/restore-$1.pid" prev
+  mkdir -p "$DIR"
+  if [ -f "$pidf" ]; then kill "$(cat "$pidf")" 2>/dev/null; rm -f "$pidf"; fi   # a newer switch supersedes a pending restore
+  { [ "${AWARE_KEEP_DEFAULT:-1}" = 1 ] && [ -f "$SETTINGS" ]; } || return 0
+  prev=$(jq -c "$2" "$SETTINGS" 2>/dev/null) || return 0
+  ( for _ in $(seq 1 900); do
+      sleep 1
+      [ -f "$SETTINGS" ] || break
+      cur=$(jq -c "$2" "$SETTINGS" 2>/dev/null) || continue
+      [ "$cur" = "$prev" ] && continue
+      jq --argjson p "$prev" 'reduce ($p | to_entries[]) as $e (.; if $e.value == null then del(.[$e.key]) else .[$e.key] = $e.value end)' \
+        "$SETTINGS" > "$SETTINGS.aware.tmp" && mv "$SETTINGS.aware.tmp" "$SETTINGS"
+      break
+    done ) >/dev/null 2>&1 &
+  echo $! > "$pidf"
+}
+
+# Type a slash command into this session's pane and log it.
+type_cmd() {
+  tmux send-keys -t "$TMUX_PANE" -l "$1" || return 4
+  sleep 0.2
+  tmux send-keys -t "$TMUX_PANE" Enter || return 4
+  mkdir -p "$DIR"; printf '%s %s pane=%s\n' "$(date -Is)" "$1" "$TMUX_PANE" >> "$DIR/switches.log"
+}
+
+latest() { ls -t "$DIR"/*.json 2>/dev/null | head -1; }
+panefile() { [ -n "${TMUX_PANE:-}" ] && printf '%s/pane-%s.json' "$DIR" "${TMUX_PANE#%}"; }
+
+allowed_has() { local w; for w in $1; do [ "$w" = "$2" ] && return 0; done; return 1; }
+
+case "${1:-}" in
+  statusline)
+    mkdir -p "$DIR"
+    in=$(cat)
+    sid=$(printf '%s' "$in" | jq -r '.session_id // "unknown"')
+    printf '%s' "$in" > "$DIR/$sid.json.tmp" && mv "$DIR/$sid.json.tmp" "$DIR/$sid.json"
+    pf=$(panefile) && printf '%s' "$in" > "$pf"
+    summarize "$DIR/$sid.json" | head -1
+    ;;
+  hook)
+    in=$(cat)
+    sid=$(printf '%s' "$in" | jq -r '.session_id // empty')
+    f="$DIR/$sid.json"; [ -f "$f" ] || exit 0   # nothing yet (before first API response)
+    # Hook output stays in the history, so only speak when something meaningful changed
+    # (tier, a 10% band, model, effort). Critical repeats every prompt.
+    sig=$(summarize "$f" sig); st="$DIR/$sid.hook"
+    [ -n "$sig" ] || exit 0
+    if [ "${AWARE_EVERY_TURN:-0}" != 1 ] && [ "${sig%%|*}" != critical ] \
+       && [ -f "$st" ] && [ "$(cat "$st")" = "$sig" ]; then exit 0; fi
+    printf '%s' "$sig" > "$st"
+    out=$(summarize "$f")
+    if [ "${AWARE_QUIET:-0}" = 1 ]; then out=$(printf '%s\n' "$out" | sed -n '2,$p'); fi
+    [ -n "$out" ] && printf '%s\n' "$out"
+    ;;
+  show)
+    f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest)
+    [ -n "$f" ] || { echo "no data yet (the statusline writes it after the first response; start with 'aware launch')" >&2; exit 1; }
+    summarize "$f"
+    ;;
+  switch)
+    kind="${2:-}"; val="${3:-}"
+    case "$kind" in
+      model)  allowed="$MODELS";  cmd="/model $val" ;;
+      effort) allowed="$EFFORTS"; cmd="/effort $val" ;;
+      *) echo "usage: aware switch model|effort <value>" >&2; exit 1 ;;
+    esac
+    # Strict allowlist: this value is typed into a terminal, so nothing else gets through.
+    allowed_has "$allowed" "$val" || { echo "refused: '$val' is not one of: $allowed" >&2; exit 2; }
+    [ -n "${TMUX_PANE:-}" ] || { echo "not inside tmux (start with 'aware launch'); ask the user to run: $cmd" >&2; exit 3; }
+    # /model writes .model and /effort writes .modelSettings[<model>].effortLevel (older versions:
+    # .effortLevel) as the user's default in settings.json (verified live, 2.1.328). Undo that.
+    if [ "$kind" = model ]; then
+      [ "$(jq -c '.model // null' "$SETTINGS" 2>/dev/null)" = "\"$val\"" ] || keep_default model '{model}'
+    else
+      keep_default effort '{modelSettings, effortLevel}'
+    fi
+    type_cmd "$cmd" || exit 4
+    # Opt-in: confirm the "Switch model?" dialog ourselves. Enter is only sent once a dialog naming THIS
+    # model is on screen (never blindly), and the watcher gives up after AWARE_CONFIRM_WAIT seconds.
+    auto=0
+    if [ "$kind" = model ] && [ "${AWARE_AUTOCONFIRM:-0}" = 1 ]; then
+      auto=1
+      [ -f "$DIR/confirm.pid" ] && kill "$(cat "$DIR/confirm.pid")" 2>/dev/null
+      pane="$TMUX_PANE"
+      ( for _ in $(seq 1 "${AWARE_CONFIRM_WAIT:-600}"); do
+          sleep 1
+          scr=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || break
+          if grep -qi 'Switch model?' <<<"$scr" && grep -qiE "Yes, switch to $val" <<<"$scr"; then
+            tmux send-keys -t "$pane" Enter
+            printf '%s autoconfirmed /model %s pane=%s\n' "$(date -Is)" "$val" "$pane" >> "$DIR/switches.log"
+            break
+          fi
+        done ) >/dev/null 2>&1 &
+      echo $! > "$DIR/confirm.pid"
+    fi
+    if [ "$kind" = model ] && [ "$auto" = 1 ]; then
+      echo "typed '$cmd'. After this turn Claude Code shows a 'Switch model?' dialog (the prompt cache is dropped, so the next reply re-reads the whole history); aware will confirm it automatically. Your default model in settings.json is left unchanged."
+    elif [ "$kind" = model ]; then
+      echo "typed '$cmd'. After this turn Claude Code shows a 'Switch model?' dialog (the prompt cache is dropped, so the next reply re-reads the whole history and costs more); the USER must confirm it with Enter. Your default model in settings.json is left unchanged."
+    else
+      echo "typed '$cmd'; it takes effect once the current turn ends and keeps the prompt cache. Your default effort in settings.json is left unchanged."
+    fi
+    ;;
+  compact)
+    # No arguments on purpose: nothing but the literal "/compact" is ever typed.
+    [ "${AWARE_ALLOW_COMPACT:-1}" = 1 ] || { echo "refused: compact is disabled (AWARE_ALLOW_COMPACT=0)" >&2; exit 2; }
+    [ -n "${TMUX_PANE:-}" ] || { echo "not inside tmux (start with 'aware launch'); ask the user to run: /compact" >&2; exit 3; }
+    type_cmd "/compact" || exit 4
+    echo "typed '/compact'; it runs once the current turn ends and replaces the history with a summary. Put anything that must survive (goal, next steps, key file paths) in this reply. A model switch right after compacting is cheap."
+    ;;
+  launch)
+    shift
+    command -v tmux >/dev/null || { echo "aware launch needs tmux" >&2; exit 1; }
+    settings=$(jq -cn --arg bin "$SELF" '{statusLine:{type:"command",command:"\($bin) statusline"},hooks:{UserPromptSubmit:[{hooks:[{type:"command",command:"\($bin) hook"}]}]}}')
+    # alwaysLoad: keep aware's tools in the prompt instead of deferred behind tool search; deferred,
+    # Claude ignored even an explicit "call set_effort medium now" advisory (verified live, 2.1.329).
+    mcp=$(jq -cn --arg bin "$SELF" '{mcpServers:{aware:{command:$bin,args:["mcp"],alwaysLoad:true}}}')
+    fwd=(); for v in $(compgen -e | grep '^AWARE_'); do fwd+=("$v=${!v}"); done
+    cmd=(env ${fwd[@]+"${fwd[@]}"} claude --settings "$settings" --mcp-config "$mcp" "$@")
+    if [ -n "${TMUX:-}" ]; then exec "${cmd[@]}"; fi
+    exec tmux new-session -s "aware-$$" -- "${cmd[@]}"
+    ;;
+  mcp)
+    exec python3 -I "$HERE/aware_mcp.py" "$SELF"
+    ;;
+  install)
+    mkdir -p "$(dirname "$BIN")" "$(dirname "$SETTINGS")"
+    ln -sf "$SELF" "$BIN"
+    [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+    cp "$SETTINGS" "$SETTINGS.aware-backup"
+    existing=$(jq -r '.statusLine.command // empty' "$SETTINGS")
+    if [ -n "$existing" ] && [ "$existing" != "$BIN statusline" ]; then
+      echo "A different statusLine is already set ($existing); leaving it alone." >&2
+      keep=1
+    else keep=0; fi
+    jq --arg bin "$BIN" --argjson keep "$keep" '
+      (if $keep == 0 then .statusLine = {type:"command", command:"\($bin) statusline"} else . end)
+      | .hooks.UserPromptSubmit = ([(.hooks.UserPromptSubmit // [])[] | select((.hooks[0].command // "") | endswith("aware hook") | not)]
+                                   + [{hooks:[{type:"command", command:"\($bin) hook"}]}])
+    ' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS" || { rm -f "$SETTINGS.tmp"; echo "install failed; settings untouched" >&2; exit 1; }
+    echo "Installed globally. Backup: $SETTINGS.aware-backup. (switch/MCP tools still need 'aware launch'.)"
+    ;;
+  uninstall)
+    [ -f "$SETTINGS" ] || exit 0
+    cp "$SETTINGS" "$SETTINGS.aware-backup"
+    jq '
+      (if ((.statusLine.command // "") | endswith("aware statusline")) then del(.statusLine) else . end)
+      | (if .hooks.UserPromptSubmit then .hooks.UserPromptSubmit |= map(select((.hooks[0].command // "") | endswith("aware hook") | not)) else . end)
+      | (if .hooks.UserPromptSubmit == [] then del(.hooks.UserPromptSubmit) else . end)
+      | (if .hooks == {} then del(.hooks) else . end)
+    ' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS" || { rm -f "$SETTINGS.tmp"; echo "uninstall failed; settings untouched" >&2; exit 1; }
+    echo "Removed from $SETTINGS (backup: $SETTINGS.aware-backup)."
+    ;;
+  *)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; exit 1 ;;
+esac
