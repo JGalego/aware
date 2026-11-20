@@ -2,7 +2,7 @@
 # Self-contained tests: fake HOME, throwaway tmux server. Touches nothing real.
 set -u
 ROOT=$(cd "$(dirname "$0")" && pwd)
-T=$(mktemp -d); trap 'tmux -L awaretest kill-server 2>/dev/null; rm -rf "$T"' EXIT
+T=$(mktemp -d); trap 'tmux -L awaretest kill-server 2>/dev/null; [ -n "${STUB:-}" ] && kill $STUB 2>/dev/null; rm -rf "$T"' EXIT
 export HOME="$T/home"; mkdir -p "$HOME/.claude" "$HOME/.local/bin"
 echo '{"model":"sonnet","tui":"fullscreen"}' > "$HOME/.claude/settings.json"
 A="$ROOT/aware"; pass=0; fail=0
@@ -95,6 +95,106 @@ check "critical repeats every prompt"          '[[ "$(hk d2)" == *"tier=critical
 fx d3 85 10 10 3600 500000 true | "$A" statusline >/dev/null
 check "quiet mode: advice only"                '[[ "$(hk d3 AWARE_QUIET=1)" == "[aware] tier=conserve"* ]]'
 
+echo "decider (pluggable decision model)"
+cat > "$T/stub.py" <<'PY'
+import http.server, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        open(os.environ['STUB_REQ'], 'wb').write(body)
+        open(os.environ['STUB_REQ'] + '.hdr', 'w').write(str(self.headers))
+        data = open(os.environ['STUB_RESP'], 'rb').read()
+        self.send_response(200 if self.path == '/v1/systemone' else 404)
+        self.send_header('Content-Type', 'application/json'); self.end_headers(); self.wfile.write(data)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(('127.0.0.1', 0), H); print(s.server_address[1], flush=True); s.serve_forever()
+PY
+export STUB_REQ="$T/req.json" STUB_RESP="$T/resp.json"
+python3 -I "$T/stub.py" > "$T/port" & STUB=$!
+for _ in $(seq 1 50); do [ -s "$T/port" ] && break; sleep 0.1; done
+URL="http://127.0.0.1:$(cat "$T/port")"
+# ans <effort> <ec> <model> <mc> <compact>: canned decider answer
+ans() { printf '{"answers":{"effort":{"choice":"%s","confidence":%s},"model":{"choice":"%s","confidence":%s},"compact":{"noul":%s}}}' "$@" > "$STUB_RESP"; }
+# dstate <sid> <5h%> <ctx%> <effort> <model>: a session on the "latest" slot, then decide
+dstate() { fx "$1" "$2" 10 "$3" 3600 500000 true | jq -c ".effort.level=\"$4\" | .model.id=\"$5\"" | "$A" statusline >/dev/null; }
+dec() { env -u TMUX_PANE AWARE_DECIDER_URL="$URL" "$@" "$A" decide; }
+
+dstate q1 85 20 high claude-opus-5-5
+check "no decider: rules decide (conserve -> medium + sonnet)" '[ "$(env -u TMUX_PANE "$A" decide | jq -c "[.source,.effort,.model]")" = "[\"rules\",\"medium\",\"sonnet\"]" ]'
+ans low 0.9 haiku 0.9 0.2
+d=$(dec env)
+check "decider answers are used when confident"  '[ "$(echo "$d" | jq -c "[.source,.effort,.model,.compact]")" = "[\"decider\",\"low\",\"haiku\",false]" ]'
+check "request: three typed questions"           '[ "$(jq -c "[.questions.effort.type,.questions.model.type,.questions.compact.type]" "$STUB_REQ")" = "[\"choice\",\"choice\",\"noul\"]" ]'
+check "request: options come from AWARE_EFFORTS/MODELS" '[ "$(jq -c "[(.questions.effort.criteria|keys),(.questions.model.criteria|keys)]" "$STUB_REQ")" = "[[\"high\",\"low\",\"max\",\"medium\",\"xhigh\"],[\"haiku\",\"opus\",\"sonnet\"]]" ]'
+check "request: state has the numbers"           'jq -e ".state|test(\"5h 85%\") and test(\"model claude-opus-5-5\") and test(\"effort high\") and test(\"cache warm\")" "$STUB_REQ" >/dev/null'
+check "request: no prompt text by default"       '! grep -q "secret refactor" "$STUB_REQ"'
+ans high 0.4 opus 0.4 0.5
+check "low confidence falls back to the rules"   '[ "$(dec env | jq -c "[.source,.effort,.model]")" = "[\"decider\",\"medium\",\"sonnet\"]" ]'
+ans medium 0.9 opus 0.9 0.5
+check "answer equal to current -> no change"     '[ "$(dec env | jq -c "[.effort,.model]")" = "[\"medium\",null]" ]'
+dstate q2 85 20 low claude-sonnet-5-5
+ans high 0.7 opus 0.7 0.5
+check "step up needs UP_CONF (0.7 < 0.85)"       '[ "$(dec env | jq -c "[.effort,.model]")" = "[null,null]" ]'
+check "raw choice is kept when a step up is held back" '[ "$(dec env | jq -c ".said")" = "{\"effort\":\"high\",\"model\":\"opus\"}" ]'
+ans high 0.9 opus 0.9 0.5
+check "step up allowed at high confidence"       '[ "$(dec env | jq -c "[.effort,.model]")" = "[\"high\",\"opus\"]" ]'
+dstate q2n 20 10 low claude-sonnet-5-5
+ans high 0.7 opus 0.7 0.5
+check "normal tier: step up needs only MIN_CONF"   '[ "$(dec env | jq -c "[.tier,.effort,.model]")" = "[\"normal\",\"high\",\"opus\"]" ]'
+ans high 0.5 opus 0.5 0.5
+check "normal tier: below MIN_CONF still held back" '[ "$(dec env | jq -c "[.effort,.model]")" = "[null,null]" ]'
+dstate q2 85 20 low claude-sonnet-5-5
+ans high 0.9 opus 0.9 0.5
+check "thresholds configurable (UP_CONF)"        '[ "$(dec env AWARE_DECIDER_UP_CONF=0.95 | jq -c "[.effort,.model]")" = "[null,null]" ]'
+ans turbo 0.99 gpt 0.99 0.5
+dstate q2b 85 20 high claude-opus-5-5
+check "unknown option names are ignored (rules)"  '[ "$(dec env | jq -c "[.effort,.model]")" = "[\"medium\",\"sonnet\"]" ]'
+printf '{"answers":{"effort":{"choice":"low","probabilities":{"low":0.8,"high":0.2}},"model":{"choice":"haiku","confidence":0.9},"compact":0.9}}' > "$STUB_RESP"
+dstate q3 85 20 high claude-opus-5-5
+check "confidence from probabilities; plain-number noul" '[ "$(dec env | jq -c "[.effort,.compact]")" = "[\"low\",true]" ]'
+check "unreachable decider -> rules + error"     '[ "$(env -u TMUX_PANE AWARE_DECIDER_URL=http://127.0.0.1:9 "$A" decide | jq -c "[.source,(.error|test(\"unreachable\"))]")" = "[\"rules\",true]" ]'
+# hosted deciders: bearer key + model name
+ans low 0.9 haiku 0.9 0.2; dstate q4 85 20 high claude-opus-5-5
+dec env AWARE_DECIDER_KEY=sk-test-123 AWARE_DECIDER_MODEL=jev-latest >/dev/null
+check "key sent as Authorization: Bearer"         'grep -qi "^authorization: Bearer sk-test-123" "$STUB_REQ.hdr"'
+check "model name sent when set"                  '[ "$(jq -r .model "$STUB_REQ")" = jev-latest ]'
+dec env >/dev/null
+check "no key / no model: neither is sent"        '! grep -qi "^authorization" "$STUB_REQ.hdr" && [ "$(jq "has(\"model\")" "$STUB_REQ")" = false ]'
+check "key never appears in the decision output"  '! dec env AWARE_DECIDER_KEY=sk-test-123 | grep -q sk-test-123'
+dec env >/dev/null; env -u TMUX_PANE AWARE_DECIDER_URL="$URL" "$A" decide --prompt "fix a typo in the README" >/dev/null
+check "decide --prompt sends the task text"       'jq -e ".state|test(\"Latest user request: fix a typo in the README\")" "$STUB_REQ" >/dev/null'
+env -u TMUX_PANE AWARE_DECIDER_URL="$URL" "$A" decide --prompt "$(printf 'x%.0s' $(seq 1 500))" >/dev/null
+check "decide --prompt is cut to 300 characters"  '[ "$(jq -r ".state" "$STUB_REQ" | grep -o "x*$" | head -1 | wc -c)" -le 302 ]'
+check "key file removed after the call"           '[ -z "$(ls -A "$HOME/.claude/aware" | grep "^.hdr")" ]'
+echo 'not json' > "$STUB_RESP"
+check "garbled answer -> rules + error"          '[ "$(dec env | jq -c "[.source,.error]")" = "[\"rules\",\"decider answer not understood\"]" ]'
+
+# hook: dry-run logs, advise advises, the prompt is only sent on request
+ans low 0.9 haiku 0.9 0.9
+hkd() { echo "{\"session_id\":\"$1\",\"prompt\":\"my secret refactor plan\"}" | env "${@:2}" "$A" hook; }
+rm -f "$HOME/.claude/aware/decisions.log"
+dstate hq 85 20 high claude-opus-5-5
+base=$(hkd hq)
+dstate hq2 85 20 high claude-opus-5-5
+dry=$(hkd hq2 AWARE_DECIDER_URL="$URL")
+check "dry mode: hook output unchanged"          '[ "$dry" = "$base" ]'
+check "dry mode: decision logged"                '[ "$(jq -c "[.sid,.mode,.source,.effort,.model,.compact]" "$HOME/.claude/aware/decisions.log")" = "[\"hq2\",\"dry\",\"decider\",\"low\",\"haiku\",true]" ]'
+dstate hq3 85 20 high claude-opus-5-5
+adv=$(hkd hq3 AWARE_DECIDER_URL="$URL" AWARE_DECIDER_MODE=advise)
+check "advise mode: decider's steps replace the rules'" '[[ "$adv" == *"(decider): call set_effort low now; at the next natural break call set_model haiku; call compact at the next natural break; delegate"* && "$adv" != *"set_effort medium"* ]]'
+check "advise mode: usage line kept"             '[[ "$adv" == "[usage]"* ]]'
+dstate hq4 85 20 high claude-opus-5-5
+hkd hq4 AWARE_DECIDER_URL="$URL" >/dev/null
+check "prompt not sent by default"               '! grep -q "secret refactor" "$STUB_REQ"'
+dstate hq5 85 20 high claude-opus-5-5
+hkd hq5 AWARE_DECIDER_URL="$URL" AWARE_DECIDER_PROMPT=1 >/dev/null
+check "AWARE_DECIDER_PROMPT=1 sends it"          'jq -e ".state|test(\"Latest user request: my secret refactor plan\")" "$STUB_REQ" >/dev/null'
+dstate hq6 85 20 high claude-opus-5-5
+check "decider down: hook still gives the rules advice" '[[ "$(hkd hq6 AWARE_DECIDER_URL=http://127.0.0.1:9 AWARE_DECIDER_MODE=advise)" == *"tier=conserve"*"set_effort medium"* ]]'
+dstate hq7 20 10 high claude-opus-5-5
+ans high 0.99 opus 0.99 0.1
+check "normal tier + nothing to change: silent line" '[[ "$(hkd hq7 AWARE_DECIDER_URL="$URL" AWARE_DECIDER_MODE=advise | wc -l)" = 1 ]]'
+
 echo "switch: validation"
 for v in "haiku; rm -rf ~" $'haiku\nrm' "fable" "" "../x" '$(id)'; do
   TMUX_PANE=%1 "$A" switch model "$v" >/dev/null 2>&1; rc=$?
@@ -179,6 +279,10 @@ check "env reaches claude" '[ "$(AWARE_AUTOCONFIRM=1 AWARE_WARN=55 TMUX=fake PAT
 printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && echo "$2"; shift; done\n' > "$T/stub/claude"
 check "launch: MCP server is alwaysLoad" '[ "$(TMUX=fake PATH="$T/stub:$PATH" "$A" launch | jq .mcpServers.aware.alwaysLoad)" = true ]'
 printf '#!/bin/sh\necho "FWD=$AWARE_AUTOCONFIRM/$AWARE_WARN"\n' > "$T/stub/claude"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > %s\nexec /usr/bin/env "$@"\n' "$T/envargs" > "$T/stub/env"; chmod +x "$T/stub/env"
+printf '#!/bin/sh\necho "KEY=$AWARE_DECIDER_KEY"\n' > "$T/stub/claude"
+check "launch: decider key inherited, not an argument" '[[ "$(AWARE_DECIDER_KEY=sk-secret AWARE_WARN=55 TMUX=fake PATH="$T/stub:$PATH" "$A" launch)" == "KEY=sk-secret" ]] && ! grep -q sk-secret "$T/envargs" && grep -qx "AWARE_WARN=55" "$T/envargs"'
+printf '#!/bin/sh\necho "FWD=$AWARE_AUTOCONFIRM/$AWARE_WARN"\n' > "$T/stub/claude"; rm -f "$T/stub/env"
 check "launch works with no AWARE_* set" '[ "$(env -u AWARE_AUTOCONFIRM -u AWARE_WARN TMUX=fake PATH="$T/stub:$PATH" "$A" launch)" = "FWD=/" ]'
 
 echo "mcp"

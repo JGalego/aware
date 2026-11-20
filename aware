@@ -6,6 +6,7 @@
 #   aware switch model  <name>   type "/model <name>" into this tmux pane (applies after the current turn)
 #   aware switch effort <level>  type "/effort <level>" into this tmux pane
 #   aware compact                type "/compact" into this tmux pane (applies after the current turn)
+#   aware decide [--prompt TEXT] JSON decision (effort / model / compact); TEXT describes the task (first 300 chars)
 #   aware install | uninstall    optional: wire statusline + hook into ~/.claude/settings.json globally
 #   aware statusline | hook | mcp   (internal) called by Claude Code
 #
@@ -21,6 +22,14 @@
 #   AWARE_QUIET=1        hook injects only when an advisory fires
 #   AWARE_EVERY_TURN=1   hook injects on every prompt (default: only when the tier, model, effort or a 10% band changes)
 #   AWARE_ALLOW_COMPACT=0   refuse "aware compact"
+#   AWARE_DECIDER_URL=   decision model (POST <url>/v1/systemone); empty = the built-in rules decide
+#   AWARE_DECIDER_KEY=   bearer token for a hosted decider (sent as "Authorization: Bearer ...", never logged)
+#   AWARE_DECIDER_MODEL= model name for hosted deciders that require one (e.g. jev-latest)
+#   AWARE_DECIDER_MODE=dry   dry: only log decisions; advise: the hook advises what the decider says
+#   AWARE_DECIDER_MIN_CONF=0.6   below this confidence a field falls back to the rules
+#   AWARE_DECIDER_UP_CONF=0.85   confidence needed to advise a costlier model/effort (above tier "normal")
+#   AWARE_DECIDER_TIMEOUT=2      seconds before the decider is given up on (rules decide)
+#   AWARE_DECIDER_PROMPT=0       1 = also send the latest prompt (first 300 chars) to the decider
 #   AWARE_MODELS="haiku sonnet opus"           models switch may select
 #   AWARE_EFFORTS="low medium high xhigh max"  effort levels switch may select
 #   AWARE_AUTOCONFIRM=1  press Enter on the "Switch model?" dialog for you (only when it names the new model)
@@ -62,6 +71,7 @@ with_limits() {
 # summarize FILE [lines|sig]
 #   lines (default): line 1 status, line 2 (only when tier != normal) "[aware] tier=..." advice.
 #   sig: one line the hook compares between prompts (tier, 10% bands, model, effort).
+#   state: one JSON object with the numbers, the tier and what the rules would do (input for decide).
 summarize() {
   with_limits "$1" | jq -r --arg mode "${2:-lines}" --arg models "$MODELS" --argjson now "$NOW" \
         --argjson lean "$LEAN" --argjson warn "$WARN" --argjson crit "$CRIT" \
@@ -100,21 +110,6 @@ summarize() {
        else "normal" end) as $tier
     | (.model.id // .model.display_name // "?") as $model
     | (.effort.level // "n/a") as $effort
-    | def band: if . == null then "?" else . / 10 | floor | tostring end;
-      if $mode == "sig" then
-        # empty = nothing measured yet (Claude Code runs the statusline before the first response)
-        if $h5.u == null and $d7.u == null and $c == null then ""
-        else "\($tier)|\($h5.u | band)|\($d7.u | band)|\($c | band)|\($model)|\($effort)" end
-      else
-        ([ (if ($h5.u // 0) >= $lean then "5h \($h5.u | pct)" else empty end),
-           (if ($d7.u // 0) >= $lean then "7d \($d7.u | pct)" else empty end),
-           (if ($h5.p // 0) > 1 then "5h pace \($h5.p | dec1)x, out ~\($h5.out | day)" else empty end),
-           (if ($d7.p // 0) > 1 then "7d pace \($d7.p | dec1)x, out ~\($d7.out | day)" else empty end),
-           (if $c0 >= $ctxlean then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
-        | (if $warm == false then "costs nothing extra now: the cache is cold"
-           elif $recache == 0 then "costs nothing extra now: nothing is cached yet"
-           elif $recache != null then "re-reads ~\($recache | ktok) tokens uncached"
-           else "re-reads the whole context uncached" end) as $switchcost
         # Concrete steps (vague advice gets ignored, verified live): name the exact call when the
         # current effort or model is above what the tier calls for.
         | {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4} as $rank
@@ -132,6 +127,32 @@ summarize() {
         # Delegation: the cheapest model for mechanical work, the next one up where judgment is needed.
         | ("delegate bulk work to cheaper-model subagents (\($ml[0] // "haiku") for search, reads, summaries"
            + (if $n > 2 then "; \($ml[1]) when judgment is needed" else "" end) + ")") as $deleg
+    | def band: if . == null then "?" else . / 10 | floor | tostring end;
+      if $mode == "sig" then
+        # empty = nothing measured yet (Claude Code runs the statusline before the first response)
+        if $h5.u == null and $d7.u == null and $c == null then ""
+        else "\($tier)|\($h5.u | band)|\($d7.u | band)|\($c | band)|\($model)|\($effort)" end
+      elif $mode == "state" then
+        # Everything a decider needs, plus what the rules would do (the fallback).
+        {tier: $tier,
+         h5: {u: $h5.u, p: $h5.p}, d7: {u: $d7.u, p: $d7.p},
+         ctx: $c, ctx_tokens: .context_window.total_input_tokens,
+         model: $model, effort: $effort, warm: $warm, recache: $recache,
+         models: $ml, deleg: $deleg,
+         rules: {effort: (if $effstep != null then $teff else null end),
+                 model: $tmodel,
+                 compact: (($tier == "conserve" or $tier == "critical") and $c0 >= $ctxwarn)}}
+        | tojson
+      else
+        ([ (if ($h5.u // 0) >= $lean then "5h \($h5.u | pct)" else empty end),
+           (if ($d7.u // 0) >= $lean then "7d \($d7.u | pct)" else empty end),
+           (if ($h5.p // 0) > 1 then "5h pace \($h5.p | dec1)x, out ~\($h5.out | day)" else empty end),
+           (if ($d7.p // 0) > 1 then "7d pace \($d7.p | dec1)x, out ~\($d7.out | day)" else empty end),
+           (if $c0 >= $ctxlean then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
+        | (if $warm == false then "costs nothing extra now: the cache is cold"
+           elif $recache == 0 then "costs nothing extra now: nothing is cached yet"
+           elif $recache != null then "re-reads ~\($recache | ktok) tokens uncached"
+           else "re-reads the whole context uncached" end) as $switchcost
         | (if $tmodel == null then null
            else "at the next natural break call set_model \($tmodel) (a switch \($switchcost))" end) as $modstep
         | (if $tier == "lean" then
@@ -151,6 +172,73 @@ summarize() {
           (if $tier == "normal" then empty else "[aware] tier=\($tier)\(if $why == "" then "" else " (\($why))" end): \($advice).\($fallback)" end)
       end
   ' 2>/dev/null
+}
+
+# decide FILE [PROMPT]: print one JSON decision {source, tier, effort, model, compact, ...}.
+# effort/model are target values (null = leave as is), compact is a boolean. With AWARE_DECIDER_URL set
+# the decision model is asked three typed questions (POST /v1/systemone: choice, choice, noul) and its
+# answers are used where confident; anything else (no URL, timeout, bad answer, low confidence) falls
+# back to the rules. Step ups need more confidence than step downs.
+decide() {
+  local st req resp err rc
+  st=$(summarize "$1" state) && [ -n "$st" ] || return 1
+  if [ -z "${AWARE_DECIDER_URL:-}" ]; then
+    jq -c '{source: "rules", tier, effort: .rules.effort, model: .rules.model, compact: .rules.compact}' <<<"$st"
+    return
+  fi
+  req=$(jq -c --arg efforts "$EFFORTS" --arg prompt "${2:-}" --arg model "${AWARE_DECIDER_MODEL:-}" '
+    def pct: if . == null then "unknown" else "\(floor)%" end;
+    def desc: {"low": "routine or mechanical steps", "medium": "typical work", "high": "hard reasoning or design decisions",
+               "xhigh": "very hard problems", "max": "only the very hardest problems",
+               "haiku": "cheapest; mechanical work", "sonnet": "balanced; most work", "opus": "most capable and most expensive; hardest reasoning"};
+    (if $model != "" then {model: $model} else {} end) + {state: ("Claude Code session. Plan usage: 5h \(.h5.u | pct)\(if .h5.p then " (pace \(.h5.p * 10 | floor / 10)x)" else "" end), 7d \(.d7.u | pct)\(if .d7.p then " (pace \(.d7.p * 10 | floor / 10)x)" else "" end). "
+              + "Context window \(.ctx | pct) full\(if .ctx_tokens then " (\(.ctx_tokens) tokens)" else "" end). Current model \(.model), effort \(.effort). "
+              + "Prompt cache \(if .warm == true then "warm" elif .warm == false then "cold" else "unknown" end). Usage tier: \(.tier)."
+              + (if $prompt != "" then " Latest user request: \($prompt)" else "" end)),
+     questions: {
+       effort: {type: "choice", instructions: "Which effort level should the assistant use for its next steps? Plan limits are finite, so prefer the lowest level that still does the job well.",
+                criteria: ($efforts | split(" ") | map(select(length > 0)) | map({key: ., value: (desc[.] // .)}) | from_entries)},
+       model: {type: "choice", instructions: "Which model should the session use for its next steps? Switching drops the prompt cache, so only change it when it clearly pays off.",
+              criteria: (.models | map({key: ., value: (desc[.] // .)}) | from_entries)},
+       compact: {type: "noul", instructions: "Should the conversation be compacted at the next natural break, given how full the context window is?"}}}' <<<"$st")
+  # The key goes through a private 0600 header file (curl -H @file), so it never shows up in `ps`.
+  local hdr="" auth=()
+  if [ -n "${AWARE_DECIDER_KEY:-}" ]; then
+    mkdir -p "$DIR"; hdr=$(umask 077; mktemp "$DIR/.hdr.XXXXXX")
+    printf 'Authorization: Bearer %s\n' "$AWARE_DECIDER_KEY" > "$hdr"; auth=(-H "@$hdr")
+  fi
+  resp=$(curl -fsS --max-time "${AWARE_DECIDER_TIMEOUT:-2}" -H 'Content-Type: application/json' ${auth[@]+"${auth[@]}"} -d "$req" \
+           "${AWARE_DECIDER_URL%/}/v1/systemone" 2>&1); rc=$?
+  [ -z "$hdr" ] || rm -f "$hdr"
+  [ $rc -eq 0 ] || {
+    err=$(printf '%s' "$resp" | tr '\n' ' ' | cut -c1-160)
+    jq -c --arg e "decider unreachable: $err" '{source: "rules", error: $e, tier, effort: .rules.effort, model: .rules.model, compact: .rules.compact}' <<<"$st"
+    return
+  }
+  jq -c --slurpfile st <(printf '%s' "$st") --arg efforts "$EFFORTS" \
+        --argjson min "${AWARE_DECIDER_MIN_CONF:-0.6}" --argjson up "${AWARE_DECIDER_UP_CONF:-0.85}" '
+    $st[0] as $s
+    # Stepping up costs plan usage, so it needs more confidence under pressure; at the normal tier
+    # a justified step up is exactly what the decider is for, so the usual threshold applies.
+    | (if $s.tier == "normal" then $min else $up end) as $upc
+    | ($efforts | split(" ") | map(select(length > 0))) as $el
+    | def pick($id; $list; $cur; $fallback):
+        (.answers[$id] // {}) as $a
+        | ($a.choice // $a.answer // $a.value) as $c
+        | ($a.confidence // ($a.probabilities | if type == "object" then (map(.) | max) else null end)) as $p
+        | ($list | index($c)) as $ci
+        | ($list | index($cur)) as $cur_i
+        | if $c == null or $p == null or $ci == null or $p < $min then {v: $fallback, p: $p, c: $c}
+          elif $c == $cur then {v: null, p: $p, c: $c}
+          elif ($cur_i != null and $ci > $cur_i and $p < $upc) then {v: null, p: $p, c: $c}
+          else {v: $c, p: $p, c: $c} end;
+    pick("effort"; $el; $s.effort; $s.rules.effort) as $e
+    | pick("model"; $s.models; ($s.model | ascii_downcase | . as $m | $s.models | map(select(. as $x | $m | contains($x))) | .[0]); $s.rules.model) as $m
+    | ((.answers.compact // null) | if type == "object" then (.noul // .probability // .p) else . end) as $cp
+    | {source: "decider", tier: $s.tier, effort: $e.v, model: $m.v,
+       compact: (if ($cp | type) != "number" then $s.rules.compact elif $cp >= $min then true elif $cp <= (1 - $min) then false else $s.rules.compact end),
+       p: {effort: $e.p, model: $m.p, compact: $cp}, said: {effort: $e.c, model: $m.c}, rules: $s.rules}' <<<"$resp" 2>/dev/null \
+    || jq -c '{source: "rules", error: "decider answer not understood", tier, effort: .rules.effort, model: .rules.model, compact: .rules.compact}' <<<"$st"
 }
 
 # keep_default KIND JQ-OBJECT: snapshot the settings.json keys a slash command is about to overwrite
@@ -208,6 +296,25 @@ case "${1:-}" in
        && [ -f "$st" ] && [ "$(cat "$st")" = "$sig" ]; then exit 0; fi
     printf '%s' "$sig" > "$st"
     out=$(summarize "$f")
+    if [ -n "${AWARE_DECIDER_URL:-}" ]; then
+      prompt=""; [ "${AWARE_DECIDER_PROMPT:-0}" = 1 ] && prompt=$(printf '%s' "$in" | jq -r '(.prompt // "")[0:300]')
+      d=$(decide "$f" "$prompt") && {
+        mkdir -p "$DIR"
+        jq -c --arg ts "$(date -Is)" --arg sid "$sid" --arg sig "$sig" --arg mode "${AWARE_DECIDER_MODE:-dry}" \
+          '{ts: $ts, sid: $sid, sig: $sig, mode: $mode} + .' <<<"$d" >> "$DIR/decisions.log"
+        if [ "${AWARE_DECIDER_MODE:-dry}" = advise ]; then
+          # the decider replaces the rules' concrete steps; the generic delegation advice stays
+          adv=$(jq -rn --argjson d "$d" --argjson s "$(summarize "$f" state)" '
+            ([ (if $d.effort then "call set_effort \($d.effort) now" else empty end),
+               (if $d.model then "at the next natural break call set_model \($d.model)" else empty end),
+               (if $d.compact then "call compact at the next natural break" else empty end),
+               (if $s.tier != "normal" then $s.deleg else empty end) ] | join("; ")) as $steps
+            | if $d.source != "decider" or $steps == "" then empty
+              else "[aware] tier=\($d.tier) (decider): \($steps)." end')
+          [ -n "$adv" ] && out="$(printf '%s\n' "$out" | sed -n 1p)"$'\n'"$adv"
+        fi
+      }
+    fi
     if [ "${AWARE_QUIET:-0}" = 1 ]; then out=$(printf '%s\n' "$out" | sed -n '2,$p'); fi
     [ -n "$out" ] && printf '%s\n' "$out"
     ;;
@@ -215,6 +322,13 @@ case "${1:-}" in
     f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest)
     [ -n "$f" ] || { echo "no data yet (the statusline writes it after the first response; start with 'aware launch')" >&2; exit 1; }
     summarize "$f"
+    ;;
+  decide)
+    prompt=""; shift
+    if [ "${1:-}" = --prompt ]; then prompt="${2:0:300}"; shift 2; fi   # what the task is (sent to the decider)
+    f="${1:-}"; [ -n "$f" ] || { f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest); }
+    [ -n "$f" ] || { echo "no data yet (start with 'aware launch')" >&2; exit 1; }
+    decide "$f" "$prompt" || { echo "nothing measured yet" >&2; exit 1; }
     ;;
   switch)
     kind="${2:-}"; val="${3:-}"
@@ -274,7 +388,9 @@ case "${1:-}" in
     # alwaysLoad: keep aware's tools in the prompt instead of deferred behind tool search; deferred,
     # Claude ignored even an explicit "call set_effort medium now" advisory (verified live, 2.1.329).
     mcp=$(jq -cn --arg bin "$SELF" '{mcpServers:{aware:{command:$bin,args:["mcp"],alwaysLoad:true}}}')
-    fwd=(); for v in $(compgen -e | grep '^AWARE_'); do fwd+=("$v=${!v}"); done
+    # AWARE_DECIDER_KEY is deliberately not forwarded as an `env VAR=value` argument (that would show up in
+    # `ps`); it is inherited through the environment instead.
+    fwd=(); for v in $(compgen -e | grep '^AWARE_' | grep -v '^AWARE_DECIDER_KEY$'); do fwd+=("$v=${!v}"); done
     cmd=(env ${fwd[@]+"${fwd[@]}"} claude --settings "$settings" --mcp-config "$mcp" "$@")
     if [ -n "${TMUX:-}" ]; then exec "${cmd[@]}"; fi
     exec tmux new-session -s "aware-$$" -- "${cmd[@]}"
