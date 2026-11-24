@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # aware: lets a Claude Code session see its own usage and change its own model/effort.
 #
-#   aware launch [claude args]   start claude inside tmux with aware wired in (no global install needed)
-#   aware show                   latest status line (+ advisory); Claude can run this via Bash too
+#   aware launch [--watch] [claude args]   start claude inside tmux with aware wired in (no global install needed);
+#                                --watch also opens the live dashboard in a pane beside it
+#   aware show [--json]          latest status line (+ advisory), or the raw state as JSON; Claude can run this via Bash too
+#   aware watch [--once]         live terminal dashboard: tier, context and plan bars, model/effort, activity
 #   aware switch model  <name>   type "/model <name>" into this tmux pane (applies after the current turn)
 #   aware switch effort <level>  type "/effort <level>" into this tmux pane
 #   aware compact                type "/compact" into this tmux pane (applies after the current turn)
@@ -139,6 +141,7 @@ summarize() {
          ctx: $c, ctx_tokens: .context_window.total_input_tokens,
          model: $model, effort: $effort, warm: $warm, recache: $recache,
          models: $ml, deleg: $deleg,
+         limits: {lean: $lean, warn: $warn, crit: $crit, ctx_lean: $ctxlean, ctx_warn: $ctxwarn},
          rules: {effort: (if $effstep != null then $teff else null end),
                  model: $tmodel,
                  compact: (($tier == "conserve" or $tier == "critical") and $c0 >= $ctxwarn)}}
@@ -148,7 +151,7 @@ summarize() {
            (if ($d7.u // 0) >= $lean then "7d \($d7.u | pct)" else empty end),
            (if ($h5.p // 0) > 1 then "5h pace \($h5.p | dec1)x, out ~\($h5.out | day)" else empty end),
            (if ($d7.p // 0) > 1 then "7d pace \($d7.p | dec1)x, out ~\($d7.out | day)" else empty end),
-           (if $c0 >= $ctxlean then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
+           (if $c0 >= $ctxlean or $c0 >= $ctxwarn then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
         | (if $warm == false then "costs nothing extra now: the cache is cold"
            elif $recache == 0 then "costs nothing extra now: nothing is cached yet"
            elif $recache != null then "re-reads ~\($recache | ktok) tokens uncached"
@@ -169,7 +172,9 @@ summarize() {
         | "[usage] \($h5 | wtxt("5h")) | \($d7 | wtxt("7d")) | ctx \($c | pct) | \(.model.display_name // .model.id // "?") | effort \($effort)"
           + (if $warm == true then " | cache warm" elif $warm == false then " | cache cold" else "" end)
           + " | $\((.cost.total_cost_usd // 0) * 100 | floor / 100)",
-          (if $tier == "normal" then empty else "[aware] tier=\($tier)\(if $why == "" then "" else " (\($why))" end): \($advice).\($fallback)" end)
+          (if $lean != 50 or $warn != 80 or $crit != 95 or $ctxlean != 50 or $ctxwarn != 70
+           then " The user set custom limits (plan \($lean)/\($warn)/\($crit)%, context \($ctxlean)/\($ctxwarn)%), so the tier is right even if the numbers look low: follow it." else "" end) as $custom
+        | (if $tier == "normal" then empty else "[aware] tier=\($tier)\(if $why == "" then "" else " (\($why))" end): \($advice).\($fallback)\($custom)" end)
       end
   ' 2>/dev/null
 }
@@ -271,7 +276,7 @@ type_cmd() {
 }
 
 latest() { ls -t "$DIR"/*.json 2>/dev/null | head -1; }
-panefile() { [ -n "${TMUX_PANE:-}" ] && printf '%s/pane-%s.json' "$DIR" "${TMUX_PANE#%}"; }
+panefile() { local p="${AWARE_WATCH_PANE:-${TMUX_PANE:-}}"; [ -n "$p" ] && printf '%s/pane-%s.json' "$DIR" "${p#%}"; }
 
 allowed_has() { local w; for w in $1; do [ "$w" = "$2" ] && return 0; done; return 1; }
 
@@ -321,7 +326,10 @@ case "${1:-}" in
   show)
     f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest)
     [ -n "$f" ] || { echo "no data yet (the statusline writes it after the first response; start with 'aware launch')" >&2; exit 1; }
-    summarize "$f"
+    if [ "${2:-}" = --json ]; then summarize "$f" state; else summarize "$f"; fi
+    ;;
+  watch)
+    exec python3 -I "$HERE/aware_watch.py" "$SELF" "${@:2}"
     ;;
   decide)
     prompt=""; shift
@@ -383,6 +391,7 @@ case "${1:-}" in
     ;;
   launch)
     shift
+    watch=0; if [ "${1:-}" = --watch ]; then watch=1; shift; fi
     command -v tmux >/dev/null || { echo "aware launch needs tmux" >&2; exit 1; }
     settings=$(jq -cn --arg bin "$SELF" '{statusLine:{type:"command",command:"\($bin) statusline"},hooks:{UserPromptSubmit:[{hooks:[{type:"command",command:"\($bin) hook"}]}]}}')
     # alwaysLoad: keep aware's tools in the prompt instead of deferred behind tool search; deferred,
@@ -392,7 +401,18 @@ case "${1:-}" in
     # `ps`); it is inherited through the environment instead.
     fwd=(); for v in $(compgen -e | grep '^AWARE_' | grep -v '^AWARE_DECIDER_KEY$'); do fwd+=("$v=${!v}"); done
     cmd=(env ${fwd[@]+"${fwd[@]}"} claude --settings "$settings" --mcp-config "$mcp" "$@")
-    if [ -n "${TMUX:-}" ]; then exec "${cmd[@]}"; fi
+    # --watch: put the live dashboard (aware watch) in a pane next to Claude, tracking that pane's session.
+    wcmd() { printf '%q ' env ${fwd[@]+"${fwd[@]}"} "AWARE_WATCH_PANE=$1" "$SELF" watch; }
+    if [ -n "${TMUX:-}" ]; then
+      [ "$watch" = 1 ] && tmux split-window -d -h -l 40% "$(wcmd "$TMUX_PANE")"
+      exec "${cmd[@]}"
+    fi
+    if [ "$watch" = 1 ]; then
+      tmux new-session -d -s "aware-$$" -- "${cmd[@]}" || exit 1
+      pane=$(tmux display-message -p -t "aware-$$" '#{pane_id}')
+      tmux split-window -d -h -l 40% -t "$pane" "$(wcmd "$pane")"
+      exec tmux attach -t "aware-$$"
+    fi
     exec tmux new-session -s "aware-$$" -- "${cmd[@]}"
     ;;
   mcp)

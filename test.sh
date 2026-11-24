@@ -52,6 +52,8 @@ check "conserve: cold cache -> switch is free" '[[ "$(view n7 85 10 20 3600 5000
 v=$(view n8 30 10 75 3600 500000 true)
 check "conserve by context"                    '[[ "$v" == *"tier=conserve (ctx 75%)"* ]]'
 check "high context -> advise compact"         '[[ "$v" == *"compact at the next natural break"* ]]'
+check "default limits: no custom-limits note"  '[[ "$v" != *"custom limits"* ]]'
+check "custom limits are announced"            '[[ "$(AWARE_CTX_WARN=3 view n8b 30 10 4 3600 500000 true)" == *"tier=conserve (ctx 4%)"*"custom limits (plan 50/80/95%, context 50/3%)"* ]]'
 check "conserve names the effort call"         '[[ "$v" == *"call set_effort medium now (currently high"* ]]'
 check "conserve names the model step (opus)"   '[[ "$(view n6 85 10 20 3600 500000 true)" == *"call set_model sonnet (a switch re-reads ~118k"* ]]'
 check "lean leaves effort high alone"          '[[ "$(view n3 40 10 10 14400 500000 true)" != *set_effort* ]]'
@@ -317,5 +319,24 @@ check "hook + statusline added" 'jq -e ".hooks.UserPromptSubmit and .statusLine"
 check "reinstall idempotent" '[ "$(jq ".hooks.UserPromptSubmit|length" "$HOME/.claude/settings.json")" = 1 ]'
 "$A" uninstall >/dev/null
 check "uninstall restores original" 'diff <(jq -S . "$HOME/.claude/settings.json") <(jq -S . "$T/orig.json") >/dev/null'
+
+echo "watch (live dashboard)"
+view n9 30 10 75 3600 500000 true >/dev/null
+check "show --json carries limits"             '"$A" show --json | jq -e ".limits.warn == 80 and .limits.ctx_warn == 70 and .tier == \"conserve\"" >/dev/null'
+w=$("$A" watch --once)
+check "watch --once: tier ladder, current marked" '[[ "$w" == *"● CONSERVE"* && "$w" == *"NORMAL"* && "$w" == *"CRITICAL"* ]]'
+check "watch --once: bars and thresholds"      '[[ "$w" == *"CONTEXT"* && "$w" == *"lean"* && "$w" == *"warn"* && "$w" == *"5H"* && "$w" == *"7D"* ]]'
+check "watch --once: model, effort, cache"     '[[ "$w" == *"model "*"effort "*"cache "* ]]'
+check "watch --once: plain when not a tty"     '! grep -q $(printf "\033") <<<"$w"'
+printf '%s /effort medium pane=%%3\n%s autoconfirmed /model sonnet pane=%%3\n' "$(date -Is)" "$(date -Is)" > "$HOME/.claude/aware/switches.log"
+w=$("$A" watch --once)
+check "watch --once: activity feed"            '[[ "$w" == *"effort set to medium"* && "$w" == *"model dialog confirmed: sonnet"* ]]'
+check "watch --once: filters by pane"          '[[ "$(AWARE_WATCH_PANE=%4 "$A" watch --once)" == *"quiet so far"* ]]'
+check "watch --once: no session yet"           '[[ "$(HOME=$T/empty "$A" watch --once)" == *"waiting for a Claude session"* ]]'
+mkdir -p "$T/stub2"; printf '#!/bin/sh\necho "$@" >> "%s/tmuxargs"\n' "$T" > "$T/stub2/tmux"; chmod +x "$T/stub2/tmux"
+rm -f "$T/tmuxargs"; TMUX=fake TMUX_PANE=%9 AWARE_WARN=55 PATH="$T/stub2:$T/stub:$PATH" "$A" launch --watch >/dev/null
+check "launch --watch splits a pane beside claude" 'grep -q "split-window -d -h -l 40%" "$T/tmuxargs" && grep -q "AWARE_WATCH_PANE=%9" "$T/tmuxargs" && grep -q "AWARE_WARN=55" "$T/tmuxargs"'
+rm -f "$T/tmuxargs"; TMUX=fake TMUX_PANE=%9 PATH="$T/stub2:$T/stub:$PATH" "$A" launch >/dev/null
+check "launch without --watch splits nothing"  '[ ! -e "$T/tmuxargs" ]'
 
 echo; echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

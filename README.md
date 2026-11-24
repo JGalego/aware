@@ -18,8 +18,10 @@
 Aware makes Claude Code sessions usage-aware, with live model and effort controls. Claude Code normally can't see how much of your 5-hour and 7-day plan it has burned, or how full its context is. Aware shows it, along with how fast it's spending, and tells it what to do about it: delegate bulk work to cheaper-model subagents, lower effort, switch model or compact at a natural break. Claude makes those changes itself, and nothing global is touched.
 
 <div align="center">
-  <img alt="aware demo: Claude reads its own usage, asks a decision model (Jev), applies the effort it suggests, and compacts" src="docs/demo.gif" width="100%">
+  <img alt="aware demo: a live dashboard beside Claude shows the context climbing from normal to conserve; Claude lowers its own effort and compacts, and the tier drops back to normal" src="docs/demo.gif" width="100%">
 </div>
+
+<sub>Recorded with the context limits lowered and a 200k window, so the tiers change within three prompts (`docs/record.sh`).</sub>
 
 
 ## Getting Started
@@ -34,6 +36,8 @@ Then start a session:
 
 ```sh
 aware launch [claude args]   # starts claude in tmux with aware wired in; nothing global is modified
+aware launch --watch         # same, with a live dashboard in a pane beside Claude
+aware watch                  # or open the dashboard on its own, in any terminal
 ```
 
 Inside that session Claude gets:
