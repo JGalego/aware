@@ -38,6 +38,7 @@ awk -v n="$TOTAL_RUNS" -v p="$PER_RUN" -v b="$BUDGET" 'BEGIN { printf "assumed c
 [ $DRY = 1 ] && exit 0
 
 mkdir -p "$OUT/runs" "$WORKROOT"
+OUT=$(cd "$OUT" && pwd)   # absolute: the sessions run elsewhere and AWARE_DIR must not be relative to their cwd
 SETTINGS="$HOME/.claude/settings.json"
 cp "$SETTINGS" "$OUT/settings.backup.json" 2>/dev/null || echo '{}' > "$OUT/settings.backup.json"
 restore_defaults() {   # put back only the keys /model and /effort touch, in case a switch left a different default
@@ -59,6 +60,10 @@ TOOLS=(Read Edit Write Glob Grep "Bash(python3:*)" "Bash(python:*)" "Bash(ls:*)"
 screen() { tmux -L $SOCK capture-pane -p -t "$1" 2>/dev/null; }
 press_yes() {   # answer permission/trust dialogs with the default (Yes) and count them
   local scr; scr=$(screen "$1")
+  if grep -q 'Yes, I trust this folder' <<<"$scr"; then   # not numbered, and the cursor starts on "No, exit"
+    echo "$(date -Is) trust dialog" >> "$RUNDIR/permissions.log"
+    tmux -L $SOCK send-keys -t "$1" Down; sleep 1; tmux -L $SOCK send-keys -t "$1" Enter; sleep 3; return 0
+  fi
   if grep -qE '❯ ?1\. Yes' <<<"$scr"; then
     PERMS=$((PERMS + 1)); echo "$(date -Is) $(grep -E 'Do you want|trust' <<<"$scr" | head -1)" >> "$RUNDIR/permissions.log"
     tmux -L $SOCK send-keys -t "$1" Enter; sleep 2; return 0
