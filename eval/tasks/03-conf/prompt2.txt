@@ -1,0 +1,1 @@
+Support [section] headers in conf.parse: keys after a '[name]' line are stored as 'name.key'; keys before any header stay as they are. A header may have a trailing comment too.

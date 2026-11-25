@@ -1,0 +1,1 @@
+sales.monthly_totals returns months in the order they first appear in the data instead of chronologically, and crashes on rows with an empty amount, which its docstring says count as 0. Fix both.

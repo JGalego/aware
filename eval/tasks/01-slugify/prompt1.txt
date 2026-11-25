@@ -1,0 +1,1 @@
+In textutil.py, slugify('Hello, World!') returns 'hello--world-' but should return 'hello-world'. Fix slugify so it matches its docstring.

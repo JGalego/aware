@@ -45,6 +45,7 @@
 #                        facts (readout only), placebo (an unrelated sentence on the same schedule), off (nothing injected).
 #                        Every injection is logged to ~/.claude/aware/injections.log with its size.
 #   AWARE_PLACEBO_TEXT=  the sentence used by the placebo arm
+#   AWARE_SIM_5H= AWARE_SIM_7D=   test-only: pretend the 5h / 7d plan windows are this % used (5h resets in 2h, 7d in 3 days)
 #   AWARE_GATE=1         at launch, refuse new Agent/Task/Workflow calls while the tier is critical (any arm);
 #                        `aware gate allow [MINUTES]` lifts it for a while (default 30). A speed bump, not a security boundary.
 #   AWARE_EFFORT_CACHE=auto  does an effort change keep the prompt cache? auto = only on Fable 5.1+, Opus/Sonnet/Haiku 5.5+ and
@@ -82,6 +83,13 @@ NOW="${AWARE_NOW:-$(date +%s)}"
 # 5h window has not reset yet; that way the very first prompt, where the goal is set, sees usage too.
 with_limits() {
   local g
+  # Test-only: AWARE_SIM_5H / AWARE_SIM_7D (percent used) overlay made-up plan limits on the readout, so the tiers
+  # can be exercised without burning real usage. The stored session JSON keeps the real numbers.
+  if [ -n "${AWARE_SIM_5H:-}${AWARE_SIM_7D:-}" ]; then
+    jq -c --argjson now "$NOW" --argjson h "${AWARE_SIM_5H:-0}" --argjson d "${AWARE_SIM_7D:-0}" \
+      '.rate_limits = {five_hour: {used_percentage: $h, resets_at: ($now + 7200)}, seven_day: {used_percentage: $d, resets_at: ($now + 259200)}}' "$1"
+    return
+  fi
   if jq -e '.rate_limits' "$1" >/dev/null 2>&1; then cat "$1"; return; fi
   for g in $(ls -t "$DIR"/*.json 2>/dev/null); do
     [ "$g" -ef "$1" ] && continue

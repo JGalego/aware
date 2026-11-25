@@ -1,0 +1,1 @@
+In intervals.py add total_covered(intervals), the total length covered by the union of the intervals, and gaps(intervals, lo, hi), the sorted list of uncovered (start, end) tuples inside [lo, hi].

@@ -1,0 +1,1 @@
+Add from_roman(s) to roman.py as the inverse of to_roman. It is case-insensitive and raises ValueError for anything that is not a canonical numeral, for example 'IIII', 'VX', 'IC', 'MMMM', letters outside IVXLCDM, or an empty string.

@@ -5,3 +5,4 @@ __pycache__/
 .env.*
 research_notes/
 reports/
+eval/results/

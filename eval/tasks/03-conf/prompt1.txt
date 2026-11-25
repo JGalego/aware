@@ -1,0 +1,1 @@
+conf.parse keeps trailing comments in values: parse('a = 1 # one') gives {'a': '1 # one'} instead of {'a': '1'}. Fix it as the docstring says.

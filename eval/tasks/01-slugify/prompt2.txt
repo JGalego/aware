@@ -1,0 +1,1 @@
+Add an optional max_len argument to slugify. When given, the result must be at most max_len characters, cut at a hyphen where possible so words are not split (a single word longer than max_len is cut hard), and never ending in a hyphen. Without max_len nothing changes.

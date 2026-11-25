@@ -531,6 +531,16 @@ for arm in tiers facts placebo off; do
 done
 check "launch: unknown arm is refused"           '! AWARE_ARM=bogus TMUX=fake PATH="$T/stubarm:$PATH" "$A" launch 2>"$T/arm.err" >/dev/null && grep -q "AWARE_ARM must be" "$T/arm.err"'
 
+echo "simulated usage (test-only overlay)"
+fx sim1 5 5 10 3600 500000 true | "$A" statusline >/dev/null
+check "no overlay: real numbers"                 '[[ "$(env -u TMUX_PANE "$A" show)" == *"5h 5%"* ]]'
+sv() { fx sim1 5 5 10 3600 500000 true | "$A" statusline >/dev/null; env -u TMUX_PANE AWARE_SIM_5H=88 AWARE_SIM_7D=40 "$@" "$A" show; }
+v=$(sv)
+check "overlay: readout shows the made-up 5h/7d" '[[ "$v" == *"5h 88% (resets "*", pace 1.5x, out ~"*"7d 40%"* ]]'
+check "overlay: conserve tier, effort advice"    '[[ "$v" == *"tier=conserve"*"call set_effort medium now"* ]]'
+check "overlay: real numbers stay in the stored JSON" '[ "$(jq .rate_limits.five_hour.used_percentage "$HOME/.claude/aware/sim1.json")" = 5 ]'
+check "overlay: 97% -> critical"                 '[[ "$(sv AWARE_SIM_5H=97)" == *"tier=critical"* ]]'
+
 echo "subagent gate"
 gh() { jq -cn --arg s "$1" --arg t "$2" '{session_id:$s,tool_name:$t,tool_input:{}}' | env "${@:3}" "$A" gate-hook; }
 fx gx 97 10 10 3600 500000 true | "$A" statusline >/dev/null

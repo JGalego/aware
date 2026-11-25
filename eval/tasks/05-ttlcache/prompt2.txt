@@ -1,0 +1,1 @@
+Add two methods to TTLCache: purge(), which drops every expired entry and returns how many it dropped, and get_or_put(key, factory), which returns the live value for key or, on a miss, stores and returns factory() (factory is called only on a miss).

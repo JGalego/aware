@@ -1,0 +1,1 @@
+merge_intervals([(1, 2), (2, 3)]) should give [(1, 3)] because touching intervals count as overlapping (see the docstring), but it returns [(1, 2), (2, 3)]. Fix it.
