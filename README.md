@@ -169,6 +169,24 @@ It is asked three questions, only when the tier, model, effort or a 10% usage ba
 
 `aware decide` prints the current decision as JSON. `effort` and `model` are targets (`null` = leave as is); `said` holds what the decider actually answered, so you can see when a step up was held back by `AWARE_DECIDER_UP_CONF`.
 
+### Measuring it
+
+Whether telling Claude its usage helps is an open question (see [Known Limits](#known-limits)), so aware can run as one of five arms. Set `AWARE_ARM` at launch:
+
+| Arm | Claude gets |
+| --- | --- |
+| `full` (default) | the readout, tier advice, the tools and the policy |
+| `tiers` | the readout and tier advice, but no tools (the advice leaves out tool calls) |
+| `facts` | the readout line only |
+| `placebo` | an unrelated sentence (`AWARE_PLACEBO_TEXT`) on exactly the schedule the readout would have had |
+| `off` | nothing |
+
+Every injection is logged to `~/.claude/aware/injections.log` (time, session, arm, size in characters), so its cost in context can be counted. The arms only change what Claude sees; the statusline, `aware watch` and the history files keep recording, so runs can be compared afterwards.
+
+### Subagent gate
+
+`AWARE_GATE=1 aware launch` also refuses new `Agent`, `Task` and `Workflow` calls while the tier is `critical` (a `PreToolUse` hook), because fan-out is where the plan burns fastest. Claude is told why and to ask you. `aware gate allow [minutes]` lifts it for a while (default 30), `aware gate revoke` puts it back. It works in every arm, so enforcement and disclosure can be tested separately. It is a speed bump, not a security boundary: Claude could run `aware gate allow` itself, though the denial tells it not to.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -181,6 +199,9 @@ It is asked three questions, only when the tier, model, effort or a 10% usage ba
 | `AWARE_RESET_SOON` | `15` | Minutes: when every plan window at or above the lean limit resets this soon, the advice is to wait instead of downgrade. |
 | `AWARE_SENSES_DIR` | `~/.claude/aware/senses` | Folder of [sense](#senses) scripts. |
 | `AWARE_SENSE_TIMEOUT` | `2` | Seconds a sense may run before it is skipped. |
+| `AWARE_ARM` | `full` | Experiment arm: `full`, `tiers`, `facts`, `placebo` or `off` (see [Measuring it](#measuring-it)). |
+| `AWARE_PLACEBO_TEXT` | a commit-message reminder | The sentence the `placebo` arm injects. |
+| `AWARE_GATE` | `0` | Set to `1` at launch to refuse new subagents and workflows at tier `critical` (see [Subagent gate](#subagent-gate)). |
 | `AWARE_QUIET` | `0` | Set to `1` to inject only the tier advice, never the plain readout. |
 | `AWARE_EVERY_TURN` | `0` | Set to `1` to inject on every prompt instead of only on change. |
 | `AWARE_ALLOW_COMPACT` | `1` | Set to `0` to refuse `compact`. |
@@ -230,7 +251,7 @@ Run the tests with `./test.sh`. They use a fake `HOME`, a private tmux server an
 - 5h/7d numbers only exist for Pro/Max/Ultra subscribers, after the first response.
 - Typing into the pane can interleave with text you are typing at that moment.
 - Model switching is not free (cache drop), so it only pays off for long remaining work; effort changes are the cheap lever, but only where they keep the cache (see the policy). The model/provider detection is a guess from the model id and environment variables; use `AWARE_EFFORT_CACHE` if it is wrong for your setup.
-- Nobody has shown that injecting usage helps. A placebo-controlled study of coding agents ([arXiv:2611.21614](https://arxiv.org/abs/2611.21614), open models only) found that telling the agent its budget did no better than an unrelated sentence; the gains came from enforced limits. Aware is untested against that: its bet is that concrete advice plus tools to act on it is different from disclosure, and it has no controlled evaluation yet.
+- Nobody has shown that injecting usage helps. A placebo-controlled study of coding agents ([arXiv:2611.21614](https://arxiv.org/abs/2611.21614), open models only) found that telling the agent its budget did no better than an unrelated sentence; the gains came from enforced limits. Aware is untested against that: its bet is that concrete advice plus tools to act on it is different from disclosure. The [experiment arms](#measuring-it) are there to test it; no results yet.
 - The usage numbers are account-wide (shared by every session on the plan); cost and context are per session. A subagent does not see aware's readout.
 - Whether the model follows the advice is up to the model. It did when the advice named an exact call and the numbers backed it up; with low numbers and a forced tier it ignored even that.
 - Stuck detection is a heuristic on tool calls (identical call and result, or many edits to one file). It cannot tell polling from looping when the output happens to repeat, so it only says "stuck?" and leaves the decision to Claude.

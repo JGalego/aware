@@ -501,4 +501,61 @@ check "launch --watch splits a pane beside claude" 'grep -q "split-window -d -h 
 rm -f "$T/tmuxargs"; TMUX=fake TMUX_PANE=%9 PATH="$T/stub2:$T/stub:$PATH" "$A" launch >/dev/null
 check "launch without --watch splits nothing"  '[ ! -e "$T/tmuxargs" ]'
 
+echo "experiment arms"
+IL="$HOME/.claude/aware/injections.log"; rm -f "$IL"
+# armhook <arm> <sid> [ENV=val ...]: a conserve-tier session, then what the hook says for that arm
+armhook() { local arm=$1 sid=$2; shift 2
+  fx "$sid" 85 20 85 3600 500000 true | "$A" statusline >/dev/null
+  echo "{\"session_id\":\"$sid\"}" | env AWARE_ARM="$arm" "$@" "$A" hook; }
+v=$(armhook full ar1)
+check "full: readout, tier and the tool calls"   '[[ "$v" == "[usage]"* && "$v" == *"tier=conserve"*"call set_effort medium now"*"call compact at the next natural break"* ]]'
+v=$(armhook tiers ar2)
+check "tiers: readout and tier advice"           '[[ "$v" == "[usage]"* && "$v" == *"tier=conserve"*"delegate bulk work"* ]]'
+check "tiers: no tool calls are mentioned"       '[[ "$v" != *set_effort* && "$v" != *set_model* && "$v" != *"call compact"* && "$v" != *"Without the aware tools"* ]]'
+v=$(armhook facts ar3)
+check "facts: the readout line only"             '[[ "$v" == "[usage]"* && "$(echo "$v" | wc -l)" = 1 && "$v" != *tier=* ]]'
+v=$(armhook placebo ar4)
+check "placebo: one unrelated sentence, no numbers" '[[ "$v" == "[note] Keep commit messages short"* && "$(echo "$v" | wc -l)" = 1 && "$v" != *"[usage]"* && "$v" != *%* ]]'
+check "placebo: text is configurable"            '[[ "$(armhook placebo ar5 AWARE_PLACEBO_TEXT="Water the plants.")" == "[note] Water the plants." ]]'
+check "off: nothing is injected"                 '[ -z "$(armhook off ar6)" ]'
+check "placebo keeps the schedule: silent when nothing changed" '[ -z "$(echo "{\"session_id\":\"ar4\"}" | AWARE_ARM=placebo "$A" hook)" ]'
+fx ar4 97 20 85 3600 500000 true | "$A" statusline >/dev/null
+check "placebo keeps the schedule: speaks on a tier change" '[[ "$(echo "{\"session_id\":\"ar4\"}" | AWARE_ARM=placebo "$A" hook)" == "[note]"* ]]'
+check "injections are logged with arm and size"  '[ "$(jq -s "map(select(.arm==\"placebo\" and .chars > 0)) | length" "$IL")" = 3 ] && [ "$(jq -s "map(select(.arm==\"off\")) | length" "$IL")" = 0 ]'
+check "stuck detection is full-only"             '[ -z "$(AWARE_ARM=facts thd ar7 a)$(AWARE_ARM=facts thd ar7 b)$(AWARE_ARM=facts thd ar7 c)" ]'
+arm_mcp() { printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && echo "$2"; shift; done\n' > "$T/stubarm/claude"; }
+mkdir -p "$T/stubarm"; arm_mcp; chmod +x "$T/stubarm/claude"
+check "launch full: MCP tools registered"        '[ "$(AWARE_ARM=full TMUX=fake PATH="$T/stubarm:$PATH" "$A" launch | jq -r ".mcpServers | keys | join(\",\")")" = aware ]'
+for arm in tiers facts placebo off; do
+  check "launch $arm: no MCP tools"              '[ "$(AWARE_ARM=$arm TMUX=fake PATH="$T/stubarm:$PATH" "$A" launch | jq -c .mcpServers)" = "{}" ]'
+done
+check "launch: unknown arm is refused"           '! AWARE_ARM=bogus TMUX=fake PATH="$T/stubarm:$PATH" "$A" launch 2>"$T/arm.err" >/dev/null && grep -q "AWARE_ARM must be" "$T/arm.err"'
+
+echo "subagent gate"
+gh() { jq -cn --arg s "$1" --arg t "$2" '{session_id:$s,tool_name:$t,tool_input:{}}' | env "${@:3}" "$A" gate-hook; }
+fx gx 97 10 10 3600 500000 true | "$A" statusline >/dev/null
+fx gy 85 10 10 3600 500000 true | "$A" statusline >/dev/null
+d=$(gh gx Agent AWARE_GATE=1)
+check "critical: Agent is denied"                '[ "$(echo "$d" | jq -r .hookSpecificOutput.permissionDecision)" = deny ] && [ "$(echo "$d" | jq -r .hookSpecificOutput.hookEventName)" = PreToolUse ]'
+check "denial says why and who can lift it"      '[[ "$(echo "$d" | jq -r .hookSpecificOutput.permissionDecisionReason)" == *"critical (5h 97% of the limit)"*"aware gate allow"*"do not run that yourself"* ]]'
+check "critical: Task and Workflow are denied too" '[ "$(gh gx Task AWARE_GATE=1 | jq -r .hookSpecificOutput.permissionDecision)" = deny ] && [ "$(gh gx Workflow AWARE_GATE=1 | jq -r .hookSpecificOutput.permissionDecision)" = deny ]'
+check "critical: other tools pass"               '[ -z "$(gh gx Bash AWARE_GATE=1)" ]'
+check "below critical: Agent passes"             '[ -z "$(gh gy Agent AWARE_GATE=1)" ]'
+check "gate off (no AWARE_GATE): Agent passes"   '[ -z "$(gh gx Agent AWARE_GATE=0)" ]'
+check "unknown session: Agent passes"            '[ -z "$(gh nope Agent AWARE_GATE=1)" ]'
+check "gate works in every arm"                  '[ "$(gh gx Agent AWARE_GATE=1 AWARE_ARM=off | jq -r .hookSpecificOutput.permissionDecision)" = deny ]'
+check "gate status: on"                          '[[ "$("$A" gate status)" == "on"* ]]'
+"$A" gate allow 10 >/dev/null
+check "gate allow: Agent passes while lifted"    '[ -z "$(gh gx Agent AWARE_GATE=1)" ] && [[ "$("$A" gate status)" == "lifted until"* ]]'
+echo $((now - 5)) > "$HOME/.claude/aware/gate.allow"
+check "gate allow: expires"                      '[ "$(gh gx Agent AWARE_GATE=1 | jq -r .hookSpecificOutput.permissionDecision)" = deny ]'
+"$A" gate allow 10 >/dev/null; "$A" gate revoke >/dev/null
+check "gate revoke: denies again"                '[ "$(gh gx Agent AWARE_GATE=1 | jq -r .hookSpecificOutput.permissionDecision)" = deny ]'
+check "gate allow rejects a non-number"          '! "$A" gate allow soon 2>/dev/null'
+printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --settings ] && echo "$2"; shift; done\n' > "$T/stubarm/claude"
+check "launch with AWARE_GATE=1: PreToolUse gate registered" '[ "$(AWARE_GATE=1 TMUX=fake PATH="$T/stubarm:$PATH" "$A" launch | jq -r ".hooks.PreToolUse[0] | .matcher + \" \" + .hooks[0].command")" = "Agent|Task|Workflow $ROOT/aware gate-hook" ]'
+check "launch without it: no PreToolUse hook"    '[ "$(TMUX=fake PATH="$T/stubarm:$PATH" "$A" launch | jq ".hooks | has(\"PreToolUse\")")" = false ]'
+gh gx Agent AWARE_GATE=1 TMUX_PANE=%3 >/dev/null
+check "watch --once: a refusal shows in the feed" '[[ "$(AWARE_WATCH_PANE=%3 "$A" watch --once)" == *"refused Agent at 5h 97%"* ]]'
+
 echo; echo "$pass passed, $fail failed"; [ $fail -eq 0 ]

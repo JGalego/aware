@@ -147,7 +147,7 @@ def read_events(path, pane, limit):
     """Moves aware made (switches.log) plus stuck warnings and measured effects (events.log), oldest first."""
     out = []
     for fname, pattern in (("switches.log", r"(\S+) (autoconfirmed )?(/\w+)(?: (\S+))? pane=(\S+)"),
-                           ("events.log", r"(\S+) (stuck|effect) pane=(\S+) (.*)")):
+                           ("events.log", r"(\S+) (stuck|effect|gate) pane=(\S+) (.*)")):
         try:
             with open(os.path.join(os.path.dirname(path), fname)) as fh:
                 lines = fh.readlines()[-200:]
@@ -307,12 +307,12 @@ def frame(st, tr, events, now, width, once=False, senses=None):
     # Activity feed: what aware actually did, newest last.
     L.append("  " + paint("ACTIVITY", fg=MUTED, bold=True) + " " + paint("─" * max(4, w - 10), fg=FAINT))
     icons = {"/effort": ("effort", TEAL), "/model": ("model", BLUE), "/compact": ("compact", ORANGE),
-             "stuck": ("stuck", RED), "effect": ("effect", GREEN)}
+             "stuck": ("stuck", RED), "effect": ("effect", GREEN), "gate": ("gate", ORANGE)}
     shown = 0
     for when, auto, cmd, arg in events[-5:]:
         name, col = icons.get(cmd, (cmd, FG))
         text = {"/effort": "effort set to %s" % arg, "/model": ("model dialog confirmed: %s" if auto else "model set to %s") % arg,
-                "/compact": "compacting the conversation"}.get(cmd, arg if cmd in ("stuck", "effect") else cmd)
+                "/compact": "compacting the conversation"}.get(cmd, arg if cmd in ("stuck", "effect", "gate") else cmd)
         L.append("  " + paint(when.strftime("%H:%M:%S"), fg=MUTED) + "  " + paint("▸", fg=col) + " " + paint(text, fg=FG))
         shown += 1
     if not shown:

@@ -10,6 +10,7 @@
 #   aware compact                type "/compact" into this tmux pane (applies after the current turn)
 #   aware decide [--prompt TEXT] JSON decision (effort / model / compact); TEXT describes the task (first 300 chars)
 #   aware senses [enable|disable NAME | --json]   your own awareness entries (see README: Senses)
+#   aware gate [allow [MINUTES] | revoke | status]   the optional subagent gate (AWARE_GATE=1, see below)
 #   aware install | uninstall    optional: wire statusline + hooks into ~/.claude/settings.json globally
 #   aware statusline | hook | tool-hook | mcp   (internal) called by Claude Code
 #
@@ -40,6 +41,12 @@
 #   AWARE_AUTOCONFIRM=1  press Enter on the "Switch model?" dialog for you (only when it names the new model)
 #   AWARE_CONFIRM_WAIT=600  seconds the auto-confirm watcher waits for that dialog
 #   AWARE_KEEP_DEFAULT=1    restore your default model in settings.json after a switch (0 = leave it)
+#   AWARE_ARM=full       experiment arm, for measuring what aware does: full (everything), tiers (readout + tier advice, no tools),
+#                        facts (readout only), placebo (an unrelated sentence on the same schedule), off (nothing injected).
+#                        Every injection is logged to ~/.claude/aware/injections.log with its size.
+#   AWARE_PLACEBO_TEXT=  the sentence used by the placebo arm
+#   AWARE_GATE=1         at launch, refuse new Agent/Task/Workflow calls while the tier is critical (any arm);
+#                        `aware gate allow [MINUTES]` lifts it for a while (default 30). A speed bump, not a security boundary.
 #   AWARE_EFFORT_CACHE=auto  does an effort change keep the prompt cache? auto = only on Fable 5.1+, Opus/Sonnet/Haiku 5.5+ and
 #                           not on Bedrock/Vertex/Foundry or a custom ANTHROPIC_BASE_URL; yes/no force the answer
 set -u
@@ -55,6 +62,7 @@ CTX_WARN="${AWARE_CTX_WARN:-70}"
 RESET_SOON="${AWARE_RESET_SOON:-15}"
 # Claude Code keeps the prompt cache across an effort change only on some models and only when talking to
 # Anthropic directly (API key or subscription); cloud providers and gateways re-read everything.
+ARM="${AWARE_ARM:-full}"
 EFFORT_CACHE="${AWARE_EFFORT_CACHE:-auto}"
 if [ "$EFFORT_CACHE" = auto ]; then
   if [ -n "${CLAUDE_CODE_USE_BEDROCK:-}${CLAUDE_CODE_USE_VERTEX:-}${CLAUDE_CODE_USE_FOUNDRY:-}" ]; then EFFORT_CACHE=provider
@@ -90,7 +98,7 @@ with_limits() {
 summarize() {
   with_limits "$1" | jq -r --arg mode "${2:-lines}" --arg models "$MODELS" --argjson now "$NOW" \
         --argjson lean "$LEAN" --argjson warn "$WARN" --argjson crit "$CRIT" \
-        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" --argjson soon "$RESET_SOON" --arg effcache "$EFFORT_CACHE" '
+        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" --argjson soon "$RESET_SOON" --arg effcache "$EFFORT_CACHE" --arg arm "$ARM" '
     def pct:  if . == null then "?" else "\(floor)%" end;
     def day:  strflocaltime("%a %H:%M");
     def dec1: (. * 10 + 0.5 | floor) as $t | "\($t / 10 | floor).\($t % 10)";
@@ -152,6 +160,10 @@ summarize() {
         | (if $nearest == null then null
            else "the \($nearest.k) limit (\($nearest.w.u | floor)%) resets in \((($nearest.w.r - $now) / 60) | floor)m, so waiting beats downgrading: finish this step, or tell the user you are pausing until then" end) as $waitnote
         | (if $waiting then null else $effstep end) as $effstep
+        # Experiment arms: only "full" has the tools, so only "full" is told to use them; "tiers" and "full" get advice.
+        | ($arm == "full") as $act
+        | ($arm == "full" or $arm == "tiers") as $advise
+        | (if $act then $effstep else null end) as $effstep
         # AWARE_MODELS is ordered cheapest to most expensive. Step down one place from the current model:
         # at conserve only from the most expensive, at critical from anywhere above the cheapest.
         | ($model | ascii_downcase) as $m
@@ -186,17 +198,17 @@ summarize() {
            (if ($h5.p // 0) > 1 then "5h pace \($h5.p | dec1)x, out ~\($h5.out | day)" else empty end),
            (if ($d7.p // 0) > 1 then "7d pace \($d7.p | dec1)x, out ~\($d7.out | day)" else empty end),
            (if $c0 >= $ctxlean or $c0 >= $ctxwarn then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
-        | (if $tmodel == null then null
+        | (if $tmodel == null or ($act | not) then null
            else "at the next natural break call set_model \($tmodel) (a switch \($switchcost))" end) as $modstep
         | (if $tier == "lean" then
              [$waitnote, $effstep, $deleg, "keep replies and tool output short"]
            elif $tier == "conserve" then
              [$waitnote, $effstep, $deleg, $modstep,
-              (if $c0 >= $ctxwarn then "call compact at the next natural break" else null end)]
+              (if $c0 >= $ctxwarn and $act then "call compact at the next natural break" else null end)]
            else
              ["finish the current step, write a short state summary, and ask the user before starting anything new", $waitnote, $effstep, $modstep]
            end | map(select(. != null)) | join("; ")) as $advice
-        | (if $tier == "conserve" or $tier == "critical" then
+        | (if $act and ($tier == "conserve" or $tier == "critical") then
              " Without the aware tools, tell the user the command instead (e.g. /effort medium, /model sonnet, /compact)."
            else "" end) as $fallback
         | "[usage] \($h5 | wtxt("5h")) | \($d7 | wtxt("7d")) | ctx \($c | pct) | \(.model.display_name // .model.id // "?") | effort \($effort)"
@@ -204,7 +216,7 @@ summarize() {
           + " | $\((.cost.total_cost_usd // 0) * 100 | floor / 100)",
           (if $lean != 50 or $warn != 80 or $crit != 95 or $ctxlean != 50 or $ctxwarn != 70
            then " The user set custom limits (plan \($lean)/\($warn)/\($crit)%, context \($ctxlean)/\($ctxwarn)%), so the tier is right even if the numbers look low: follow it." else "" end) as $custom
-        | (if $tier == "normal" then empty else "[aware] tier=\($tier)\(if $why == "" then "" else " (\($why))" end): \($advice).\($fallback)\($custom)" end)
+        | (if $tier == "normal" or ($advise | not) then empty else "[aware] tier=\($tier)\(if $why == "" then "" else " (\($why))" end): \($advice).\($fallback)\($custom)" end)
       end
   ' 2>/dev/null
 }
@@ -315,13 +327,16 @@ usage_hook() {
   local f=$1 sid=$2 in=$3 sig st out prompt d adv
   # Hook output stays in the history, so only speak when something meaningful changed
   # (tier, a 10% band, model, effort). Critical repeats every prompt.
+  [ "$ARM" = off ] && return 0
   sig=$(summarize "$f" sig); st="$DIR/$sid.hook"
   [ -n "$sig" ] || return 0
   if [ "${AWARE_EVERY_TURN:-0}" != 1 ] && [ "${sig%%|*}" != critical ] \
      && [ -f "$st" ] && [ "$(cat "$st")" = "$sig" ]; then return 0; fi
   printf '%s' "$sig" > "$st"
   out=$(summarize "$f")
-  if [ -n "${AWARE_DECIDER_URL:-}" ]; then
+  # placebo arm: same schedule as the real readout, but an unrelated sentence of similar length
+  [ "$ARM" = placebo ] && out="[note] ${AWARE_PLACEBO_TEXT:-Keep commit messages short and follow the naming style the repository already uses. Mention the files you changed in your final summary.}"
+  if [ "$ARM" = full ] && [ -n "${AWARE_DECIDER_URL:-}" ]; then
     prompt=""; [ "${AWARE_DECIDER_PROMPT:-0}" = 1 ] && prompt=$(printf '%s' "$in" | jq -r '(.prompt // "")[0:300]')
     d=$(decide "$f" "$prompt") && {
       mkdir -p "$DIR"
@@ -340,8 +355,22 @@ usage_hook() {
       fi
     }
   fi
-  if [ "${AWARE_QUIET:-0}" = 1 ]; then out=$(printf '%s\n' "$out" | sed -n '2,$p'); fi
-  [ -n "$out" ] && printf '%s\n' "$out"
+  if [ "${AWARE_QUIET:-0}" = 1 ] && [ "$ARM" != placebo ]; then out=$(printf '%s\n' "$out" | sed -n '2,$p'); fi
+  [ -n "$out" ] || return 0
+  log_injection "$sid" "$out"
+  printf '%s\n' "$out"
+}
+
+# log_injection SID TEXT: one JSON line per injection, so what aware costs in context can be measured
+log_injection() {
+  mkdir -p "$DIR"
+  jq -cn --arg ts "$(date -Is)" --arg sid "$1" --arg arm "$ARM" --arg t "$2" '{ts: $ts, sid: $sid, arm: $arm, chars: ($t | length)}' >> "$DIR/injections.log"
+}
+
+# gate_allowed: true while the user has lifted the gate and the allowance has not expired
+gate_allowed() {
+  local until; until=$(cat "$DIR/gate.allow" 2>/dev/null) || return 1
+  [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$NOW" ]
 }
 
 case "${1:-}" in
@@ -364,12 +393,38 @@ case "${1:-}" in
     sid=$(printf '%s' "$in" | jq -r '.session_id // empty')
     f="$DIR/$sid.json"; [ -f "$f" ] || exit 0   # nothing yet (before first API response)
     out=$(usage_hook "$f" "$sid" "$in")
-    extra=$(AWARE_FILE="$f" python3 -I "$HERE/aware_senses.py" hook-extra "$sid" 2>/dev/null)
-    [ -n "$extra" ] && out="${out:+$out$'\n'}$extra"
+    extra=""; [ "$ARM" = full ] && extra=$(AWARE_FILE="$f" python3 -I "$HERE/aware_senses.py" hook-extra "$sid" 2>/dev/null)
+    if [ -n "$extra" ]; then out="${out:+$out$'\n'}$extra"; log_injection "$sid" "$extra"; fi
     [ -n "$out" ] && printf '%s\n' "$out"
     ;;
   tool-hook)
+    [ "$ARM" = full ] || exit 0
     exec python3 -I "$HERE/aware_senses.py" tool-hook
+    ;;
+  gate-hook)
+    # PreToolUse: while the tier is critical, refuse new subagents/workflows (fan-out is where the plan burns fastest).
+    in=$(cat)
+    [ "${AWARE_GATE:-0}" = 1 ] || exit 0
+    tool=$(printf '%s' "$in" | jq -r '.tool_name // empty')
+    case "$tool" in Agent|Task|Workflow) ;; *) exit 0 ;; esac
+    sid=$(printf '%s' "$in" | jq -r '.session_id // empty')
+    f="$DIR/$sid.json"; [ -f "$f" ] || exit 0
+    gate_allowed && exit 0
+    st=$(summarize "$f" state) || exit 0
+    [ "$(jq -r '.tier' <<<"$st")" = critical ] || exit 0
+    why=$(jq -r '([{k:"5h",u:.h5.u},{k:"7d",u:.d7.u}] | map(select(.u != null)) | max_by(.u) | "\(.k) \(.u | floor)%") // "plan usage"' <<<"$st")
+    printf '%s %s pane=%s %s\n' "$(date -Is)" gate "${TMUX_PANE:--}" "refused $tool at $why" >> "$DIR/events.log"
+    jq -cn --arg r "aware: plan usage is critical ($why of the limit), so new subagents and workflows are paused. Finish this step in the main session without fanning out, summarize where things stand, and ask the user before starting more. The user can lift this with 'aware gate allow'; do not run that yourself." \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
+    ;;
+  gate)
+    case "${2:-status}" in
+      allow)  m="${3:-30}"; [[ "$m" =~ ^[0-9]+$ ]] || { echo "usage: aware gate allow [MINUTES]" >&2; exit 1; }
+              mkdir -p "$DIR"; echo $((NOW + m * 60)) > "$DIR/gate.allow"; echo "gate lifted for $m minutes" ;;
+      revoke) rm -f "$DIR/gate.allow"; echo "gate back on" ;;
+      status) if gate_allowed; then echo "lifted until $(date -d "@$(cat "$DIR/gate.allow")" +%H:%M)"; else echo "on (when AWARE_GATE=1 at launch)"; fi ;;
+      *) echo "usage: aware gate [allow [MINUTES] | revoke | status]" >&2; exit 1 ;;
+    esac
     ;;
   show)
     f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest)
@@ -458,10 +513,13 @@ case "${1:-}" in
     shift
     watch=0; if [ "${1:-}" = --watch ]; then watch=1; shift; fi
     command -v tmux >/dev/null || { echo "aware launch needs tmux" >&2; exit 1; }
-    settings=$(jq -cn --arg bin "$SELF" '{statusLine:{type:"command",command:"\($bin) statusline"},hooks:{UserPromptSubmit:[{hooks:[{type:"command",command:"\($bin) hook"}]}],PostToolUse:[{hooks:[{type:"command",command:"\($bin) tool-hook"}]}]}}')
+    case "$ARM" in full|tiers|facts|placebo|off) ;; *) echo "aware: AWARE_ARM must be full, tiers, facts, placebo or off (got '$ARM')" >&2; exit 1 ;; esac
+    settings=$(jq -cn --arg bin "$SELF" --arg gate "${AWARE_GATE:-0}" '{statusLine:{type:"command",command:"\($bin) statusline"},hooks:{UserPromptSubmit:[{hooks:[{type:"command",command:"\($bin) hook"}]}],PostToolUse:[{hooks:[{type:"command",command:"\($bin) tool-hook"}]}]}}
+      | if $gate == "1" then .hooks.PreToolUse = [{matcher:"Agent|Task|Workflow",hooks:[{type:"command",command:"\($bin) gate-hook"}]}] else . end')
     # alwaysLoad: keep aware's tools in the prompt instead of deferred behind tool search; deferred,
     # Claude ignored even an explicit "call set_effort medium now" advisory (verified live, 2.1.329).
-    mcp=$(jq -cn --arg bin "$SELF" '{mcpServers:{aware:{command:$bin,args:["mcp"],alwaysLoad:true}}}')
+    # Only the "full" arm has the tools (and the policy sent with them); the other arms are readout/advice only.
+    mcp=$(jq -cn --arg bin "$SELF" --arg arm "$ARM" '{mcpServers: (if $arm == "full" then {aware:{command:$bin,args:["mcp"],alwaysLoad:true}} else {} end)}')
     # AWARE_DECIDER_KEY is deliberately not forwarded as an `env VAR=value` argument (that would show up in
     # `ps`); it is inherited through the environment instead.
     fwd=(); for v in $(compgen -e | grep '^AWARE_' | grep -v '^AWARE_DECIDER_KEY$'); do fwd+=("$v=${!v}"); done
