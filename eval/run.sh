@@ -62,7 +62,13 @@ press_yes() {   # answer permission/trust dialogs with the default (Yes) and cou
   local scr; scr=$(screen "$1")
   if grep -q 'Yes, I trust this folder' <<<"$scr"; then   # not numbered, and the cursor starts on "No, exit"
     echo "$(date -Is) trust dialog" >> "$RUNDIR/permissions.log"
-    tmux -L $SOCK send-keys -t "$1" Down; sleep 1; tmux -L $SOCK send-keys -t "$1" Enter; sleep 3; return 0
+    local try   # never press Enter until the cursor is on "Yes": a lost keypress would otherwise select "No, exit"
+    for try in 1 2 3 4; do
+      grep -qE '❯ ?Yes, I trust' <<<"$(screen "$1")" && break
+      tmux -L $SOCK send-keys -t "$1" Down; sleep 1
+    done
+    grep -qE '❯ ?Yes, I trust' <<<"$(screen "$1")" && tmux -L $SOCK send-keys -t "$1" Enter
+    sleep 3; return 0
   fi
   if grep -qE '❯ ?1\. Yes' <<<"$scr"; then
     PERMS=$((PERMS + 1)); echo "$(date -Is) $(grep -E 'Do you want|trust' <<<"$scr" | head -1)" >> "$RUNDIR/permissions.log"
@@ -167,6 +173,7 @@ run_one() {   # run_one TASK ARM REP
                               cache_hits: .prompt_cache.hit_ratio, cache_misses: .prompt_cache.misses,
                               real_5h: .rate_limits.five_hour.used_percentage, real_7d: .rate_limits.seven_day.used_percentage}),
        injections: ($inj | length), injected_chars: ([$inj[] | .chars] | add // 0)}' >> "$OUT/runs.jsonl"
+  LAST_STATUS=$status
   SPENT=$(awk -v a="$SPENT" -v b="$cost" 'BEGIN { printf "%.4f", a + b }'); DONE=$((DONE + 1))
   printf '%-28s %-8s check %s/%s  $%.2f  %4ss  perms=%s moves=%s  [spent $%s of $%s]\n' "$RID" "$status" "$c1" "$c2" "$cost" "$wall" "$PERMS" "$moves" "$SPENT" "$BUDGET"
   rm -rf "$WORK"
@@ -183,6 +190,7 @@ for rep in $(seq 1 "$REPS"); do
       fi
       guard
       run_one "$tn" "$arm" "$rep"
+      if [ "$LAST_STATUS" = no_start ]; then echo "  start failed, retrying once" >&2; run_one "$tn" "$arm" "$rep"; fi
     done
   done
 done
