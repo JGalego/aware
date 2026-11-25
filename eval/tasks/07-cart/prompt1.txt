@@ -1,1 +1,0 @@
-The receipt total is a cent off for some discounted lines (prices are integer cents, rounding should be half up), and refunds print the wrong amount: a -150 cent amount prints -2.50 instead of -1.50. Find and fix both.

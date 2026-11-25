@@ -1,1 +1,0 @@
-Extend calc.evaluate with '^' for exponentiation (right-associative, binding tighter than * and /, and tighter than a unary minus on its left, so -2^2 is -4 and 2^3^2 is 512) and with the functions min(a, b) and max(a, b), each taking exactly two arguments.

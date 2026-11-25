@@ -1,1 +1,0 @@
-TTLCache in cache.py does not match its docstring: a key that was just read is still evicted before older untouched keys, an entry is still returned at exactly ttl seconds after it was stored, and len() counts expired entries. Fix all three.

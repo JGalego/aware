@@ -76,7 +76,14 @@ press_yes() {   # answer permission/trust dialogs with the default (Yes) and cou
   fi
   return 1
 }
-send_prompt() { tmux -L $SOCK send-keys -t "$1" -l "$(tr '\n' ' ' < "$2")"; sleep 0.6; tmux -L $SOCK send-keys -t "$1" Enter; }
+send_prompt() {   # long text is collapsed into a "[Pasted text]" block; Enter sent too soon is swallowed, so check it was submitted
+  tmux -L $SOCK send-keys -t "$1" -l "$(tr '\n' ' ' < "$2")"; sleep 2
+  local try
+  for try in 1 2 3 4; do
+    tmux -L $SOCK send-keys -t "$1" Enter; sleep 3
+    grep -q 'Pasted text' <<<"$(screen "$1" | grep '❯')" || return 0
+  done
+}
 wait_stops() {   # wait_stops PANE N: until the Stop hook has fired N times
   local t0=$SECONDS
   while [ "$(wc -l < "$WORK/stops" 2>/dev/null || echo 0)" -lt "$2" ]; do

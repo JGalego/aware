@@ -1,1 +1,0 @@
-calc.evaluate fails on '-3 + 5' and '2 * -4', and raises IndexError instead of ValueError for '(1 + 2' and for the empty string. Make unary minus work and make malformed input raise ValueError as the docstring says.
