@@ -46,6 +46,7 @@ Inside that session Claude gets:
 - a usage readout (5h / 7d plan usage with pace, context %, model, effort, cache state, cost), injected only when something meaningful changes
 - a tier (`lean`, `conserve`, `critical`) with concrete next steps when usage or context runs high, e.g. `call set_effort medium now`
 - MCP tools `get_usage`, `set_model`, `set_effort`, `compact`
+- optional [senses](#senses): readings you define (machine load, other sessions, anything a script can measure), plus built-in watchers for being stuck and for what its own switches saved
 
 ## How it works
 
@@ -58,6 +59,7 @@ flowchart LR
     subgraph SENSE["📡 Sense"]
         Status["<b>statusline</b><br/>usage · pace · context · cache"]
         Store[("session<br/>JSON")]
+        Senses["<b>senses</b><br/>your scripts · stuck? · effects"]
     end
 
     subgraph DECIDE["🧠 Decide"]
@@ -73,6 +75,7 @@ flowchart LR
 
     Launch(["⚡ <b>aware launch</b>"]) ==>|"session-local config"| Claude
     Claude -->|"usage JSON"| Status --> Store --> Hook
+    Claude -->|"tool calls"| Senses --> Hook
     Hook --- Rules
     Hook <-.->|"POST /v1/systemone<br/>typed answers + confidence"| DM
     Hook ==>|"usage + tier advice"| Claude
@@ -87,7 +90,7 @@ flowchart LR
     classDef opt fill:#8957e50d,stroke:#8957e5,stroke-dasharray:5 4
     classDef act fill:#2da44e26,stroke:#2da44e
     class Claude,Launch agent
-    class Status,Store sense
+    class Status,Store,Senses sense
     class Hook,Rules decide
     class DM opt
     class MCP,Switch act
@@ -96,6 +99,8 @@ flowchart LR
 - The statusline command receives Claude Code's JSON (rate limits, cost, context, prompt cache) and saves it per session and per tmux pane.
 - A `UserPromptSubmit` hook injects that readout into the model's context. Hook output stays in the history, so it only speaks when the tier, model, effort or a 10% usage band changes (`critical` repeats every prompt). Until a session has its own numbers, it borrows the account-wide 5h/7d figures from the freshest other session, so the first prompt (where the goal is set) sees usage too.
 - `set_model` / `set_effort` / `compact` type `/model <x>` / `/effort <x>` / `/compact` into the tmux pane. Slash commands only run at the start of a message, so they apply once the current turn ends.
+- A `PostToolUse` hook watches for repeats (the same call with identical results three times in a row, or five edits to one file within eight calls) and says so once, in the same turn.
+- After `set_effort`, `set_model` or `compact`, the hook later reports what the move did to cost per turn (`effect of /effort medium: cost per turn $0.31 -> $0.19`), or says plainly when nothing dropped.
 - Optionally, a decision model weighs in. Its answers are used where it is confident, and the rules decide everything else (see [Decision model](#decision-model-optional)).
 - Values are checked against an allowlist before anything is typed (`AWARE_MODELS`, `AWARE_EFFORTS`; `compact` takes no arguments). Every command is logged to `~/.claude/aware/switches.log`.
 
@@ -118,6 +123,28 @@ The worst signal wins. **Pace** is the share of a window used divided by the sha
 | `lean` | 5h/7d ≥ 50%, context ≥ 50%, or any pace > 1 | delegate to cheaper-model subagents, keep output short, effort at most `high` |
 | `conserve` | 5h/7d ≥ 80% or context ≥ 70% | effort `medium`, Opus steps down to Sonnet at a natural break, compact if context is high |
 | `critical` | 5h/7d ≥ 95% | finish the step, summarize, ask the user; effort `low`, step down a model |
+
+When a high plan window is about to reset (default: within 15 minutes, `AWARE_RESET_SOON`), the hook says so instead of advising a downgrade: switching costs a cache re-read, and waiting is cheaper than saving tokens the reset is about to refill. That only applies when every window at or above the lean limit is resetting soon.
+
+### Senses
+
+A sense is a reading you want Claude to know about. Put an executable in `~/.claude/aware/senses/` that prints one line, `LEVEL READING | ADVICE`, where `LEVEL` is `ok`, `warn` or `crit`:
+
+```sh
+#!/usr/bin/env bash
+echo "warn 3 jobs queued | wait for the queue to drain before starting a build"
+```
+
+Senses follow the same rules as the usage readout. They are silent while `ok`, reported when their level changes (`crit` repeats each prompt), announced once when they recover, and shown in `get_usage` and in `aware watch`. They never change the usage tier; each carries its own advice. A sense gets `AWARE_SESSION_ID` and `AWARE_FILE` (the session's JSON) in its environment.
+
+```sh
+aware senses                    # what is enabled, with current readings, and the shipped examples
+aware senses enable machine     # free RAM and CPU load (AWARE_MACHINE_WARN_MB=2000, AWARE_MACHINE_CRIT_MB=1000)
+aware senses enable sessions    # Claude sessions active on this plan (AWARE_SESSIONS_WARN=3)
+aware senses disable machine
+```
+
+Because a sense's output goes straight into Claude's context, aware treats it as untrusted: ANSI escapes and control characters are stripped, the reading is capped at 80 characters and the advice at 120, a sense that takes longer than `AWARE_SENSE_TIMEOUT` (2 s) is dropped for that prompt, and only files you own that nobody else can write to are run. A sense that fails or prints something unparseable is listed by `aware senses` and never injected. Don't print text you didn't write yourself (commit messages, web pages, issue titles) without checking it first.
 
 ### Decision model (optional)
 
@@ -151,6 +178,9 @@ It is asked three questions, only when the tier, model, effort or a 10% usage ba
 | `AWARE_CRIT` | `95` | 5h/7d usage % for tier `critical`. |
 | `AWARE_CTX_LEAN` | `50` | Context % for tier `lean`. |
 | `AWARE_CTX_WARN` | `70` | Context % for tier `conserve` (and the advice to compact). |
+| `AWARE_RESET_SOON` | `15` | Minutes: when every plan window at or above the lean limit resets this soon, the advice is to wait instead of downgrade. |
+| `AWARE_SENSES_DIR` | `~/.claude/aware/senses` | Folder of [sense](#senses) scripts. |
+| `AWARE_SENSE_TIMEOUT` | `2` | Seconds a sense may run before it is skipped. |
 | `AWARE_QUIET` | `0` | Set to `1` to inject only the tier advice, never the plain readout. |
 | `AWARE_EVERY_TURN` | `0` | Set to `1` to inject on every prompt instead of only on change. |
 | `AWARE_ALLOW_COMPACT` | `1` | Set to `0` to refuse `compact`. |
@@ -200,6 +230,8 @@ Run the tests with `./test.sh`. They use a fake `HOME`, a private tmux server an
 - Typing into the pane can interleave with text you are typing at that moment.
 - Model switching is not free (cache drop), so it only pays off for long remaining work; effort changes are the cheap lever.
 - Whether the model follows the advice is up to the model. It did when the advice named an exact call and the numbers backed it up; with low numbers and a forced tier it ignored even that.
+- Stuck detection is a heuristic on tool calls (identical call and result, or many edits to one file). It cannot tell polling from looping when the output happens to repeat, so it only says "stuck?" and leaves the decision to Claude.
+- The measured effect of a switch compares cost per turn over a few turns on each side. Turns differ in size, so treat it as a hint, not a benchmark.
 - Borrowed 5h/7d figures on the first prompt are as old as the other session's last response.
 - Not tested: merging with your own user-level hooks/statusline (only project-level was exercised).
 - The decision model is unproven: it looked sensible on synthetic scenarios against hosted Jev, but no model card covers choosing a model or effort for coding work. Use `dry` mode logs as evidence before `advise`.

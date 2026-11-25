@@ -21,7 +21,7 @@ if MID:
 INSTRUCTIONS = f"""\
 aware: spend this session's plan usage and context deliberately while pursuing the user's goal.
 
-Signals. A "[usage]" line arrives with a prompt whenever something meaningful changed; between those, assume nothing changed. It shows 5h/7d plan usage with pace (share used / share of the window elapsed; above 1x the limit runs out before it resets), context %, model, effort and whether the prompt cache is warm. An "[aware] tier=..." line follows when the tier is lean, conserve or critical. When it names a call (e.g. "call set_effort medium now"), make that call first, in the same turn, before working on the request, unless the user has told you otherwise; then follow the rest of its advice. Call get_usage before committing to a large piece of work or when you need fresh numbers, not every turn.
+Signals. A "[usage]" line arrives with a prompt whenever something meaningful changed; between those, assume nothing changed. It shows 5h/7d plan usage with pace (share used / share of the window elapsed; above 1x the limit runs out before it resets), context %, model, effort and whether the prompt cache is warm. An "[aware] tier=..." line follows when the tier is lean, conserve or critical. When it names a call (e.g. "call set_effort medium now"), make that call first, in the same turn, before working on the request, unless the user has told you otherwise; then follow the rest of its advice. Call get_usage before committing to a large piece of work or when you need fresh numbers, not every turn. Other "[aware]" lines are facts about your situation, not requests: "sense NAME" reports a reading the user chose to track (follow its advice), "stuck?" means you are repeating yourself (change approach or ask), and "effect of ..." tells you what your last switch saved.
 
 Cheapest moves first:
 1. Delegate bulk work to subagents on a cheaper model: only their short report enters this context. Ask them for conclusions, not dumps. Match the model to the task: "{CHEAP}" for mechanical work (search, file reads, extraction, summaries){MID_RULE} Keep the hardest reasoning in this session. A weak subagent answer that you must redo costs more than it saved, so step up a model when a result looks thin.
@@ -39,7 +39,7 @@ TOOLS = [
         "name": "get_usage",
         "description": "Fresh usage readout: 5-hour and 7-day plan usage with pace and reset times, context-window %, "
                        "model, effort, prompt-cache state and session cost, plus the current tier and advice "
-                       "(lean/conserve/critical) when it is not normal.",
+                       "(lean/conserve/critical) when it is not normal, plus any user-defined sense that is not ok.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {

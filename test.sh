@@ -56,9 +56,16 @@ check "default limits: no custom-limits note"  '[[ "$v" != *"custom limits"* ]]'
 check "custom limits are announced"            '[[ "$(AWARE_CTX_WARN=3 view n8b 30 10 4 3600 500000 true)" == *"tier=conserve (ctx 4%)"*"custom limits (plan 50/80/95%, context 50/3%)"* ]]'
 check "conserve names the effort call"         '[[ "$v" == *"call set_effort medium now (currently high"* ]]'
 check "conserve names the model step (opus)"   '[[ "$(view n6 85 10 20 3600 500000 true)" == *"call set_model sonnet (a switch re-reads ~118k"* ]]'
+v=$(fx n14 97 10 10 600 500000 true | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)
+check "reset soon: waiting beats downgrading"  '[[ "$v" == *"the 5h limit (97%) resets in 10m, so waiting beats downgrading"* && "$v" != *set_effort* && "$v" != *set_model* ]]'
+check "reset soon: critical still wraps up"    '[[ "$v" == *"tier=critical"*"ask the user before starting anything new"* ]]'
+check "reset soon: state rules hold back"      '[[ "$("$A" show --json | jq -c "[.rules.effort, .rules.model]")" == "[null,null]" ]]'
+check "reset far: normal downgrade advice"     '[[ "$(AWARE_RESET_SOON=5 env -u TMUX_PANE "$A" show)" == *"set_effort low"* ]]'
+v=$(fx n15 97 85 10 600 500000 true | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)
+check "reset soon but 7d still high: downgrade" '[[ "$v" == *"set_effort low"* && "$v" != *"waiting beats"* ]]'
 check "lean leaves effort high alone"          '[[ "$(view n3 40 10 10 14400 500000 true)" != *set_effort* ]]'
 check "lean steps xhigh down to high"          '[[ "$(fx n12 60 10 10 3600 500000 true | jq -c ".effort.level=\"xhigh\"" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"call set_effort high now"* ]]'
-check "critical on sonnet -> haiku"            '[[ "$(fx n13 97 10 10 600 500000 true | jq -c ".model.id=\"claude-sonnet-5-5\"" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"set_effort low"*"set_model haiku"* ]]'
+check "critical on sonnet -> haiku"            '[[ "$(fx n13 97 10 10 3600 500000 true | jq -c ".model.id=\"claude-sonnet-5-5\"" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"set_effort low"*"set_model haiku"* ]]'
 check "nothing cached yet -> switch is free"   '[[ "$(fx n14 85 10 10 3600 500000 true | jq -c ".prompt_cache.recache_tokens_if_cold=0" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"nothing is cached yet"* ]]'
 # AWARE_MODELS (cheapest to most expensive) drives both the step-down chain and the delegation hint
 vm() { fx "$1" "$2" 10 "$3" 3600 500000 true | jq -c ".model.id=\"$4\"" | "$A" statusline >/dev/null; AWARE_MODELS="$5" env -u TMUX_PANE "$A" show; }
@@ -279,6 +286,9 @@ echo "launch forwards AWARE_* env"
 mkdir -p "$T/stub"; printf '#!/bin/sh\necho "FWD=$AWARE_AUTOCONFIRM/$AWARE_WARN"\n' > "$T/stub/claude"; chmod +x "$T/stub/claude"
 check "env reaches claude" '[ "$(AWARE_AUTOCONFIRM=1 AWARE_WARN=55 TMUX=fake PATH="$T/stub:$PATH" "$A" launch)" = "FWD=1/55" ]'
 printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && echo "$2"; shift; done\n' > "$T/stub/claude"
+printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --settings ] && echo "$2"; shift; done\n' > "$T/stub/claude"
+check "launch: tool hook registered"          '[[ "$(TMUX=fake PATH="$T/stub:$PATH" "$A" launch | jq -r ".hooks.PostToolUse[0].hooks[0].command")" == *" tool-hook" ]]'
+printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && echo "$2"; shift; done\n' > "$T/stub/claude"
 check "launch: MCP server is alwaysLoad" '[ "$(TMUX=fake PATH="$T/stub:$PATH" "$A" launch | jq .mcpServers.aware.alwaysLoad)" = true ]'
 printf '#!/bin/sh\necho "FWD=$AWARE_AUTOCONFIRM/$AWARE_WARN"\n' > "$T/stub/claude"
 printf '#!/bin/sh\nprintf "%%s\\n" "$@" > %s\nexec /usr/bin/env "$@"\n' "$T/envargs" > "$T/stub/env"; chmod +x "$T/stub/env"
@@ -316,9 +326,106 @@ cp "$HOME/.claude/settings.json" "$T/orig.json"
 "$A" install >/dev/null
 check "hook + statusline added" 'jq -e ".hooks.UserPromptSubmit and .statusLine" "$HOME/.claude/settings.json" >/dev/null'
 "$A" install >/dev/null
-check "reinstall idempotent" '[ "$(jq ".hooks.UserPromptSubmit|length" "$HOME/.claude/settings.json")" = 1 ]'
+check "tool hook added too" 'jq -e ".hooks.PostToolUse[0].hooks[0].command | endswith(\"aware tool-hook\")" "$HOME/.claude/settings.json" >/dev/null'
+check "reinstall idempotent" '[ "$(jq ".hooks.UserPromptSubmit|length" "$HOME/.claude/settings.json")" = 1 ] && [ "$(jq ".hooks.PostToolUse|length" "$HOME/.claude/settings.json")" = 1 ]'
 "$A" uninstall >/dev/null
 check "uninstall restores original" 'diff <(jq -S . "$HOME/.claude/settings.json") <(jq -S . "$T/orig.json") >/dev/null'
+
+echo "senses (your own awareness entries)"
+SD="$HOME/.claude/aware/senses"; rm -rf "$SD"
+check "no senses: says so and lists examples"  '[[ "$("$A" senses)" == *"no senses enabled"*"available: machine sessions"* ]]'
+"$A" senses enable machine >/dev/null
+check "enable a shipped sense"                 '[ -L "$SD/machine" ] && [[ "$("$A" senses | grep "^machine ")" =~ ^machine\ +(ok|warn|crit)\  ]]'
+check "enable unknown sense fails"             '! "$A" senses enable nope 2>/dev/null'
+check "disable removes the link"               '"$A" senses disable machine >/dev/null && [ ! -e "$SD/machine" ]'
+check "disable refuses your own scripts"       'mkdir -p "$SD" && printf "#!/bin/sh\necho ok x\n" > "$SD/mine" && chmod +x "$SD/mine" && ! "$A" senses disable mine 2>/dev/null && [ -f "$SD/mine" ]'
+rm -f "$SD/mine"
+fx sx 20 10 10 3600 500000 true | "$A" statusline >/dev/null
+sense() { printf '#!/bin/sh\n%s\n' "$2" > "$SD/$1"; chmod 755 "$SD/$1"; }
+hk() { echo '{"session_id":"sx"}' | "$A" hook; }
+sense demo 'echo "warn 42 units | do the thing"'
+v=$(hk)
+check "hook: warn sense is reported"           '[[ "$v" == *"[aware] sense demo (warn): 42 units. do the thing"* ]]'
+check "hook: usage line still there"           '[[ "$v" == "[usage]"* ]]'
+check "hook: unchanged sense stays silent"     '[ -z "$(hk)" ]'
+sense demo 'echo "ok 1 unit"'
+check "hook: recovery is announced once"       '[[ "$(hk)" == *"sense demo: ok again (1 unit)"* && -z "$(hk)" ]]'
+sense demo 'echo "crit 99 units | stop"'
+check "hook: crit repeats every prompt"        '[[ "$(hk)" == *"(crit): 99 units"* && "$(hk)" == *"(crit): 99 units"* ]]'
+sense demo 'echo "ok fine"'; hk >/dev/null
+sense demo 'printf "warn \033[31mred\033[0m\tand\001 long %0300d | adv\n" 0'
+v=$(hk)
+check "sanitized: no escapes or controls"      '! grep -q "[[:cntrl:]]" <<<"$(grep sense <<<"$v")"'
+check "capped: readings are short"             '[ "$(grep sense <<<"$v" | wc -c)" -lt 300 ]'
+sense demo 'echo "ok fine"'; hk >/dev/null
+sense demo 'echo "warn sid=$AWARE_SESSION_ID file=$(basename "$AWARE_FILE")"'
+check "sense gets session id and file"         '[[ "$(hk)" == *"sid=sx file=sx.json"* ]]'
+sense demo 'echo "ok fine"'; hk >/dev/null
+sense slow 'sleep 5; echo "warn late"'
+SECONDS=0; v=$(AWARE_SENSE_TIMEOUT=0.5 hk); t=$SECONDS
+check "slow sense times out, hook stays quick" '[ $t -le 3 ] && [[ "$v" != *late* ]]'
+check "timeout shows up in aware senses"       '[[ "$(AWARE_SENSE_TIMEOUT=0.5 "$A" senses)" == *"slow"*"timed out"* ]]'
+rm -f "$SD/slow"
+sense bad 'echo "total nonsense"'
+check "bad output is listed, never injected"   '[[ "$("$A" senses)" == *"bad"*"bad output"* && "$(hk)" != *nonsense* ]]'
+rm -f "$SD/bad"
+sense open 'echo "warn open"'; chmod 777 "$SD/open"
+check "world-writable sense is not run"        '[[ "$("$A" senses)" == *"open"*"writable by others"* && "$(hk)" != *"sense open"* ]]'
+rm -f "$SD/open"
+sense demo 'echo "warn visible | to get_usage"'
+check "show lists non-ok senses"               '[[ "$(env -u TMUX_PANE "$A" show)" == *"[aware] sense demo (warn): visible. to get_usage"* ]]'
+rm -f "$SD/demo"
+mkdir -p "$T/sd"; printf 'x' > "$T/sd/pane-1.json"
+for n in a b c; do printf '{}' > "$T/sd/$n.json"; done
+check "sessions sense counts active sessions"  '[[ "$(AWARE_DIR=$T/sd "$ROOT/senses/sessions.sh")" == "warn 3 active sessions"* && "$(AWARE_DIR=$T/sd AWARE_SESSIONS_WARN=9 "$ROOT/senses/sessions.sh")" == "ok 3 active sessions" ]]'
+check "machine sense: levels follow thresholds" '[[ "$(AWARE_MACHINE_WARN_MB=999999999 "$ROOT/senses/machine.sh")" == "warn "* && "$(AWARE_MACHINE_CRIT_MB=999999999 "$ROOT/senses/machine.sh")" == "crit "* && "$(AWARE_MACHINE_WARN_MB=0 AWARE_MACHINE_CRIT_MB=0 "$ROOT/senses/machine.sh")" =~ ^(ok|warn)\  ]]'
+
+echo "stuck detection (tool-hook)"
+th() { jq -cn --arg s "$1" --arg t "$2" --arg c "$3" --arg r "$4" '{session_id:$s,tool_name:$t,tool_input:{command:$c,file_path:$c},tool_response:{stdout:$r}}' | "$A" tool-hook; }
+rm -f "$HOME/.claude/aware/events.log"
+o1=$(th t1 Bash "make test" "fail"); o2=$(th t1 Bash "make test" "fail"); o3=$(th t1 Bash "make test" "fail")
+check "third identical call is flagged"        '[ -z "$o1" ] && [ -z "$o2" ] && [[ "$(jq -r .hookSpecificOutput.additionalContext <<<"$o3")" == "[aware] stuck? the same Bash call ran 3 times"* ]]'
+check "reply is a valid PostToolUse hook JSON" '[ "$(jq -r .hookSpecificOutput.hookEventName <<<"$o3")" = PostToolUse ]'
+check "no nagging on the 4th and 5th"          '[ -z "$(th t1 Bash "make test" "fail")" ] && [ -z "$(th t1 Bash "make test" "fail")" ]'
+check "flagged again on the 6th"               '[[ "$(th t1 Bash "make test" "fail")" == *"6 times"* ]]'
+check "changed output is progress, not stuck"  '[ -z "$(th t2 Bash "make test" "fail 1")$(th t2 Bash "make test" "fail 2")$(th t2 Bash "make test" "fail 3")$(th t2 Bash "make test" "fail 4")" ]'
+for i in 1 2 3 4; do th t3 Edit "/x/a.py" "edit $i" >/dev/null; done
+check "five edits to one file are flagged"     '[[ "$(th t3 Edit "/x/a.py" "edit 5")" == *"5 edits to a.py in the last 8 tool calls"* ]]'
+check "edits spread over files are fine"       '[ -z "$(for f in a b c d e f; do th t4 Edit "/x/$f.py" "e"; done)" ]'
+check "stuck events reach the watch feed"      'grep -q " stuck pane=" "$HOME/.claude/aware/events.log"'
+thd() { jq -cn --arg s "$1" --arg d "$2" '{session_id:$s,tool_name:"Bash",tool_input:{command:"echo same",description:$d},tool_response:{stdout:"same",stderr:"",interrupted:false}}' | "$A" tool-hook; }
+check "descriptions do not hide a repeat"      '[ -z "$(thd t5 first)$(thd t5 second)" ] && [[ "$(thd t5 third)" == *"same Bash call ran 3 times"* ]]'
+check "garbage on stdin is ignored"            'echo "not json" | "$A" tool-hook; [ $? -eq 0 ]'
+
+echo "intervention feedback"
+now_t=$(date +%s); ts() { date -Is -d "@$1"; }
+fb() { # fb SID PANE: write a cost history (turns of $0.30, then of $0.10 after a move at base+135) and a switch log line
+  local base=$1 sid=$2 cmd=$3 after=$4
+  : > "$HOME/.claude/aware/$sid.hist"
+  local c=100 t=$((base+100)); printf '%s %s\n' "$t" "1.00" >> "$HOME/.claude/aware/$sid.hist"
+  for i in 1 2 3; do t=$((t+10)); printf '%s 1.%s\n' "$t" "$((i*3))0" >> "$HOME/.claude/aware/$sid.hist"; done
+  local cost=190; for i in 1 2 3 4; do t=$((t+10)); cost=$((cost+after)); printf '%s %s.%02d\n' "$t" "$((cost/100))" "$((cost%100))" >> "$HOME/.claude/aware/$sid.hist"; done
+  printf '%s %s pane=%%7\n' "$(ts $((base+135)))" "$cmd" >> "$HOME/.claude/aware/switches.log"
+  fx "$sid" 20 10 10 3600 500000 true | "$A" statusline >/dev/null
+}
+: > "$HOME/.claude/aware/switches.log"; rm -f "$HOME/.claude/aware/events.log"
+fb $((now_t-1000)) fb1 "/effort medium" 10
+v=$(echo '{"session_id":"fb1"}' | TMUX_PANE=%7 "$A" hook)
+check "effect: a cost drop is measured"        '[[ "$v" == *"[aware] effect of /effort medium: cost per turn \$0.30 -> \$0.10 (-67%, 3 turns before, 3 after)"* ]]'
+check "effect: reported once"                  '[[ "$(echo "{\"session_id\":\"fb1\"}" | TMUX_PANE=%7 "$A" hook)" != *effect* ]]'
+check "effect: lands in the watch feed"        'grep -q " effect pane=%7 effect of /effort medium" "$HOME/.claude/aware/events.log"'
+: > "$HOME/.claude/aware/switches.log"
+fb $((now_t-1000)) fb2 "/effort medium" 30
+v=$(echo '{"session_id":"fb2"}' | TMUX_PANE=%7 "$A" hook)
+check "effect: no drop is said plainly"        '[[ "$v" == *"effect of /effort medium"*"no clear drop yet"* ]]'
+: > "$HOME/.claude/aware/switches.log"
+fb $((now_t-1000)) fb3 "/model sonnet" 10
+v=$(echo '{"session_id":"fb3"}' | TMUX_PANE=%7 "$A" hook)
+check "effect: model switch skips rebuild turn" '[[ "$v" == *"effect of /model sonnet"*"3 turns before, 3 after"* ]]'
+: > "$HOME/.claude/aware/switches.log"
+printf '%s /effort low pane=%%7\n' "$(ts $((now_t-1000+135)))" >> "$HOME/.claude/aware/switches.log"
+fb_old=$(echo '{"session_id":"fb1"}' | TMUX_PANE=%9 "$A" hook)
+check "effect: other panes are not mixed in"   '[[ "$fb_old" != *effect* ]]'
 
 echo "watch (live dashboard)"
 view n9 30 10 75 3600 500000 true >/dev/null
@@ -333,6 +440,14 @@ w=$("$A" watch --once)
 check "watch --once: activity feed"            '[[ "$w" == *"effort set to medium"* && "$w" == *"model dialog confirmed: sonnet"* ]]'
 check "watch --once: filters by pane"          '[[ "$(AWARE_WATCH_PANE=%4 "$A" watch --once)" == *"quiet so far"* ]]'
 check "watch --once: no session yet"           '[[ "$(HOME=$T/empty "$A" watch --once)" == *"waiting for a Claude session"* ]]'
+sense demo 'echo "warn 42 units | adv"'; sense calm 'echo "ok all quiet"'
+w=$("$A" watch --once)
+check "watch --once: senses block"             '[[ "$w" == *"SENSES"*"calm"*"all quiet"*"demo"*"42 units"* ]]'
+printf '%s stuck pane=%%3 stuck? the same Bash call ran 3 times\n' "$(date -Is)" >> "$HOME/.claude/aware/events.log"
+check "watch --once: stuck shows in the feed"  '[[ "$(AWARE_WATCH_PANE=%3 "$A" watch --once)" == *"stuck? the same Bash call ran 3 times"* ]]'
+check "watch --once: effect shows in the feed" '[[ "$(AWARE_WATCH_PANE=%7 "$A" watch --once)" == *"effect of /effort"* ]]'
+rm -f "$SD/demo" "$SD/calm"
+check "watch --once: no senses, no block"      '[[ "$("$A" watch --once)" != *SENSES* ]]'
 mkdir -p "$T/stub2"; printf '#!/bin/sh\necho "$@" >> "%s/tmuxargs"\n' "$T" > "$T/stub2/tmux"; chmod +x "$T/stub2/tmux"
 rm -f "$T/tmuxargs"; TMUX=fake TMUX_PANE=%9 AWARE_WARN=55 PATH="$T/stub2:$T/stub:$PATH" "$A" launch --watch >/dev/null
 check "launch --watch splits a pane beside claude" 'grep -q "split-window -d -h -l 40%" "$T/tmuxargs" && grep -q "AWARE_WATCH_PANE=%9" "$T/tmuxargs" && grep -q "AWARE_WARN=55" "$T/tmuxargs"'

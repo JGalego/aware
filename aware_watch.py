@@ -144,24 +144,31 @@ def ktok(n):
 
 
 def read_events(path, pane, limit):
+    """Moves aware made (switches.log) plus stuck warnings and measured effects (events.log), oldest first."""
     out = []
-    try:
-        with open(path) as fh:
-            lines = fh.readlines()[-200:]
-    except OSError:
-        return out
-    for line in lines:
-        m = re.match(r"(\S+) (autoconfirmed )?(/\w+)(?: (\S+))? pane=(\S+)", line.strip())
-        if not m:
-            continue
-        ts, auto, cmd, arg, p = m.groups()
-        if pane and p != pane:
-            continue
+    for fname, pattern in (("switches.log", r"(\S+) (autoconfirmed )?(/\w+)(?: (\S+))? pane=(\S+)"),
+                           ("events.log", r"(\S+) (stuck|effect) pane=(\S+) (.*)")):
         try:
-            when = datetime.fromisoformat(ts)
-        except ValueError:
+            with open(os.path.join(os.path.dirname(path), fname)) as fh:
+                lines = fh.readlines()[-200:]
+        except OSError:
             continue
-        out.append((when, bool(auto), cmd, arg or ""))
+        for line in lines:
+            m = re.match(pattern, line.strip())
+            if not m:
+                continue
+            if fname == "events.log":
+                (ts, cmd, p, arg), auto = m.groups(), ""
+            else:
+                ts, auto, cmd, arg, p = m.groups()
+            if pane and p != pane:
+                continue
+            try:
+                when = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            out.append((when, bool(auto), cmd, arg or ""))
+    out.sort(key=lambda e: e[0])
     return out[-limit:]
 
 
@@ -201,7 +208,7 @@ def chip(label, value, hot=None, color=FG):
     return prefix + body
 
 
-def frame(st, tr, events, now, width, once=False):
+def frame(st, tr, events, now, width, once=False, senses=None):
     L = []
     w = width
     if not st:
@@ -285,14 +292,27 @@ def frame(st, tr, events, now, width, once=False):
         L.append(line)
     L.append("")
 
+    # Senses: the user's own readings, one row each.
+    if senses:
+        L.append("  " + paint("SENSES", fg=MUTED, bold=True) + " " + paint("─" * max(4, w - 8), fg=FAINT))
+        for sn in senses:
+            if "level" not in sn:
+                L.append("  " + paint("○", fg=FAINT) + " " + paint(pad(sn["name"], 10), fg=MUTED) + paint(sn.get("error", ""), fg=FAINT))
+                continue
+            col = {"ok": GREEN, "warn": ORANGE, "crit": RED}.get(sn["level"], MUTED)
+            row = "  " + paint("●", fg=col) + " " + paint(pad(sn["name"], 10), fg=FG if sn["level"] != "ok" else MUTED)
+            L.append(row + paint(sn["reading"], fg=FG if sn["level"] != "ok" else MUTED))
+        L.append("")
+
     # Activity feed: what aware actually did, newest last.
     L.append("  " + paint("ACTIVITY", fg=MUTED, bold=True) + " " + paint("─" * max(4, w - 10), fg=FAINT))
-    icons = {"/effort": ("effort", TEAL), "/model": ("model", BLUE), "/compact": ("compact", ORANGE)}
+    icons = {"/effort": ("effort", TEAL), "/model": ("model", BLUE), "/compact": ("compact", ORANGE),
+             "stuck": ("stuck", RED), "effect": ("effect", GREEN)}
     shown = 0
     for when, auto, cmd, arg in events[-5:]:
         name, col = icons.get(cmd, (cmd, FG))
         text = {"/effort": "effort set to %s" % arg, "/model": ("model dialog confirmed: %s" if auto else "model set to %s") % arg,
-                "/compact": "compacting the conversation"}.get(cmd, cmd)
+                "/compact": "compacting the conversation"}.get(cmd, arg if cmd in ("stuck", "effect") else cmd)
         L.append("  " + paint(when.strftime("%H:%M:%S"), fg=MUTED) + "  " + paint("▸", fg=col) + " " + paint(text, fg=FG))
         shown += 1
     if not shown:
@@ -308,6 +328,15 @@ def fetch(self_path):
         return None
 
 
+def fetch_senses(self_path):
+    try:
+        r = subprocess.run([self_path, "senses", "--json"], capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else []
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
 def main():
     args = sys.argv[1:]
     self_path = args[0] if args and not args[0].startswith("--") else "aware"
@@ -318,14 +347,17 @@ def main():
     start = datetime.now().astimezone()
     tr = Tracker()
 
+    senses = []
+
     def render(st, now):
         cols = shutil.get_terminal_size((80, 24)).columns
         events = read_events(log, pane, 5 if once else 200)
         if not once:
             events = [ev for ev in events if ev[0] >= start]
-        return frame(st, tr, events, now, max(46, min(cols - 4, 76)), once)
+        return frame(st, tr, events, now, max(46, min(cols - 4, 76)), once, senses)
 
     if once:
+        senses = fetch_senses(self_path)
         st = fetch(self_path)
         if st:
             tr.update(st, time.time())
@@ -334,13 +366,15 @@ def main():
 
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
     try:
-        st, last = None, 0.0
+        st, last, last_senses = None, 0.0, 0.0
         while True:
             now = time.time()
             if now - last >= 0.5:
                 st, last = fetch(self_path), now
                 if st:
                     tr.update(st, now)
+            if now - last_senses >= 5:     # senses run user scripts: poll them slowly
+                senses, last_senses = fetch_senses(self_path), now
             lines = render(st, now)
             sys.stdout.write("\x1b[H" + "".join(row + "\x1b[K\n" for row in lines) + "\x1b[J")
             sys.stdout.flush()

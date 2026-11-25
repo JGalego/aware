@@ -9,8 +9,9 @@
 #   aware switch effort <level>  type "/effort <level>" into this tmux pane
 #   aware compact                type "/compact" into this tmux pane (applies after the current turn)
 #   aware decide [--prompt TEXT] JSON decision (effort / model / compact); TEXT describes the task (first 300 chars)
-#   aware install | uninstall    optional: wire statusline + hook into ~/.claude/settings.json globally
-#   aware statusline | hook | mcp   (internal) called by Claude Code
+#   aware senses [enable|disable NAME | --json]   your own awareness entries (see README: Senses)
+#   aware install | uninstall    optional: wire statusline + hooks into ~/.claude/settings.json globally
+#   aware statusline | hook | tool-hook | mcp   (internal) called by Claude Code
 #
 # Tiers (worst signal wins): normal < lean < conserve < critical. Pace = share of a window used /
 # share of it elapsed; pace > 1 means that limit runs out before it resets.
@@ -21,6 +22,8 @@
 #   AWARE_CRIT=95        % of 5h/7d limit for tier "critical"
 #   AWARE_CTX_LEAN=50    % of context window for tier "lean"
 #   AWARE_CTX_WARN=70    % of context window for tier "conserve" (and the advice to compact)
+#   AWARE_SENSES_DIR     folder of sense scripts (default ~/.claude/aware/senses); AWARE_SENSE_TIMEOUT=2 seconds each
+#   AWARE_RESET_SOON=15  minutes: a high plan window that resets this soon gets "wait" advice, not a downgrade
 #   AWARE_QUIET=1        hook injects only when an advisory fires
 #   AWARE_EVERY_TURN=1   hook injects on every prompt (default: only when the tier, model, effort or a 10% band changes)
 #   AWARE_ALLOW_COMPACT=0   refuse "aware compact"
@@ -47,6 +50,7 @@ WARN="${AWARE_WARN:-80}"
 CRIT="${AWARE_CRIT:-95}"
 CTX_LEAN="${AWARE_CTX_LEAN:-50}"
 CTX_WARN="${AWARE_CTX_WARN:-70}"
+RESET_SOON="${AWARE_RESET_SOON:-15}"
 MODELS="${AWARE_MODELS:-haiku sonnet opus}"
 EFFORTS="${AWARE_EFFORTS:-low medium high xhigh max}"
 SETTINGS="${AWARE_SETTINGS:-$HOME/.claude/settings.json}"
@@ -77,7 +81,7 @@ with_limits() {
 summarize() {
   with_limits "$1" | jq -r --arg mode "${2:-lines}" --arg models "$MODELS" --argjson now "$NOW" \
         --argjson lean "$LEAN" --argjson warn "$WARN" --argjson crit "$CRIT" \
-        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" '
+        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" --argjson soon "$RESET_SOON" '
     def pct:  if . == null then "?" else "\(floor)%" end;
     def day:  strflocaltime("%a %H:%M");
     def dec1: (. * 10 + 0.5 | floor) as $t | "\($t / 10 | floor).\($t % 10)";
@@ -118,13 +122,22 @@ summarize() {
         | ({"lean": "high", "conserve": "medium", "critical": "low"}[$tier]) as $teff
         | (if $teff != null and ($rank[$effort] // -1) > $rank[$teff]
            then "call set_effort \($teff) now (currently \($effort); effort changes keep the cache)" else null end) as $effstep
+        # Reset proximity: when every plan window at or above the lean limit resets within $soon minutes,
+        # waiting beats downgrading (a switch costs a cache re-read; the limit is about to refill).
+        | ([{k: "5h", w: $h5}, {k: "7d", w: $d7}] | map(select((.w.u // 0) >= $lean))) as $hot
+        | ($hot | map(select(.w.r != null and .w.r > $now and (.w.r - $now) <= $soon * 60))) as $soonwin
+        | (($hot | length) > 0 and ($soonwin | length) == ($hot | length)) as $waiting
+        | (if $waiting then ($soonwin | sort_by(.w.r) | .[0]) else null end) as $nearest
+        | (if $nearest == null then null
+           else "the \($nearest.k) limit (\($nearest.w.u | floor)%) resets in \((($nearest.w.r - $now) / 60) | floor)m, so waiting beats downgrading: finish this step, or tell the user you are pausing until then" end) as $waitnote
+        | (if $waiting then null else $effstep end) as $effstep
         # AWARE_MODELS is ordered cheapest to most expensive. Step down one place from the current model:
         # at conserve only from the most expensive, at critical from anywhere above the cheapest.
         | ($model | ascii_downcase) as $m
         | ($models | split(" ") | map(select(length > 0))) as $ml
         | ($ml | length) as $n
         | ($ml | to_entries | map(select(. as $e | $m | contains($e.value))) | .[0].key) as $idx
-        | (if $idx == null or $idx == 0 then null
+        | (if $waiting or $idx == null or $idx == 0 then null
            elif $tier == "critical" or ($tier == "conserve" and $idx == $n - 1) then $ml[$idx - 1] else null end) as $tmodel
         # Delegation: the cheapest model for mechanical work, the next one up where judgment is needed.
         | ("delegate bulk work to cheaper-model subagents (\($ml[0] // "haiku") for search, reads, summaries"
@@ -159,12 +172,12 @@ summarize() {
         | (if $tmodel == null then null
            else "at the next natural break call set_model \($tmodel) (a switch \($switchcost))" end) as $modstep
         | (if $tier == "lean" then
-             [$effstep, $deleg, "keep replies and tool output short"]
+             [$waitnote, $effstep, $deleg, "keep replies and tool output short"]
            elif $tier == "conserve" then
-             [$effstep, $deleg, $modstep,
+             [$waitnote, $effstep, $deleg, $modstep,
               (if $c0 >= $ctxwarn then "call compact at the next natural break" else null end)]
            else
-             ["finish the current step, write a short state summary, and ask the user before starting anything new", $effstep, $modstep]
+             ["finish the current step, write a short state summary, and ask the user before starting anything new", $waitnote, $effstep, $modstep]
            end | map(select(. != null)) | join("; ")) as $advice
         | (if $tier == "conserve" or $tier == "critical" then
              " Without the aware tools, tell the user the command instead (e.g. /effort medium, /model sonnet, /compact)."
@@ -280,6 +293,40 @@ panefile() { local p="${AWARE_WATCH_PANE:-${TMUX_PANE:-}}"; [ -n "$p" ] && print
 
 allowed_has() { local w; for w in $1; do [ "$w" = "$2" ] && return 0; done; return 1; }
 
+# usage_hook FILE SID INPUT: the usage readout and tier advice, only when something meaningful changed
+usage_hook() {
+  local f=$1 sid=$2 in=$3 sig st out prompt d adv
+  # Hook output stays in the history, so only speak when something meaningful changed
+  # (tier, a 10% band, model, effort). Critical repeats every prompt.
+  sig=$(summarize "$f" sig); st="$DIR/$sid.hook"
+  [ -n "$sig" ] || return 0
+  if [ "${AWARE_EVERY_TURN:-0}" != 1 ] && [ "${sig%%|*}" != critical ] \
+     && [ -f "$st" ] && [ "$(cat "$st")" = "$sig" ]; then return 0; fi
+  printf '%s' "$sig" > "$st"
+  out=$(summarize "$f")
+  if [ -n "${AWARE_DECIDER_URL:-}" ]; then
+    prompt=""; [ "${AWARE_DECIDER_PROMPT:-0}" = 1 ] && prompt=$(printf '%s' "$in" | jq -r '(.prompt // "")[0:300]')
+    d=$(decide "$f" "$prompt") && {
+      mkdir -p "$DIR"
+      jq -c --arg ts "$(date -Is)" --arg sid "$sid" --arg sig "$sig" --arg mode "${AWARE_DECIDER_MODE:-dry}" \
+        '{ts: $ts, sid: $sid, sig: $sig, mode: $mode} + .' <<<"$d" >> "$DIR/decisions.log"
+      if [ "${AWARE_DECIDER_MODE:-dry}" = advise ]; then
+        # the decider replaces the rules' concrete steps; the generic delegation advice stays
+        adv=$(jq -rn --argjson d "$d" --argjson s "$(summarize "$f" state)" '
+          ([ (if $d.effort then "call set_effort \($d.effort) now" else empty end),
+             (if $d.model then "at the next natural break call set_model \($d.model)" else empty end),
+             (if $d.compact then "call compact at the next natural break" else empty end),
+             (if $s.tier != "normal" then $s.deleg else empty end) ] | join("; ")) as $steps
+          | if $d.source != "decider" or $steps == "" then empty
+            else "[aware] tier=\($d.tier) (decider): \($steps)." end')
+        [ -n "$adv" ] && out="$(printf '%s\n' "$out" | sed -n 1p)"$'\n'"$adv"
+      fi
+    }
+  fi
+  if [ "${AWARE_QUIET:-0}" = 1 ]; then out=$(printf '%s\n' "$out" | sed -n '2,$p'); fi
+  [ -n "$out" ] && printf '%s\n' "$out"
+}
+
 case "${1:-}" in
   statusline)
     mkdir -p "$DIR"
@@ -287,46 +334,43 @@ case "${1:-}" in
     sid=$(printf '%s' "$in" | jq -r '.session_id // "unknown"')
     printf '%s' "$in" > "$DIR/$sid.json.tmp" && mv "$DIR/$sid.json.tmp" "$DIR/$sid.json"
     pf=$(panefile) && printf '%s' "$in" > "$pf"
+    # cost history, one line per change: the hook compares cost per turn before/after aware's own moves
+    hist="$DIR/$sid.hist"
+    cost=$(printf '%s' "$in" | jq -r '.cost.total_cost_usd // 0')
+    [ "$(tail -n 1 "$hist" 2>/dev/null | cut -d' ' -f2)" = "$cost" ] || printf '%s %s\n' "$NOW" "$cost" >> "$hist"
+    [ "$(wc -l < "$hist")" -gt 400 ] && { tail -n 200 "$hist" > "$hist.tmp" && mv "$hist.tmp" "$hist"; }
     summarize "$DIR/$sid.json" | head -1
     ;;
   hook)
     in=$(cat)
     sid=$(printf '%s' "$in" | jq -r '.session_id // empty')
     f="$DIR/$sid.json"; [ -f "$f" ] || exit 0   # nothing yet (before first API response)
-    # Hook output stays in the history, so only speak when something meaningful changed
-    # (tier, a 10% band, model, effort). Critical repeats every prompt.
-    sig=$(summarize "$f" sig); st="$DIR/$sid.hook"
-    [ -n "$sig" ] || exit 0
-    if [ "${AWARE_EVERY_TURN:-0}" != 1 ] && [ "${sig%%|*}" != critical ] \
-       && [ -f "$st" ] && [ "$(cat "$st")" = "$sig" ]; then exit 0; fi
-    printf '%s' "$sig" > "$st"
-    out=$(summarize "$f")
-    if [ -n "${AWARE_DECIDER_URL:-}" ]; then
-      prompt=""; [ "${AWARE_DECIDER_PROMPT:-0}" = 1 ] && prompt=$(printf '%s' "$in" | jq -r '(.prompt // "")[0:300]')
-      d=$(decide "$f" "$prompt") && {
-        mkdir -p "$DIR"
-        jq -c --arg ts "$(date -Is)" --arg sid "$sid" --arg sig "$sig" --arg mode "${AWARE_DECIDER_MODE:-dry}" \
-          '{ts: $ts, sid: $sid, sig: $sig, mode: $mode} + .' <<<"$d" >> "$DIR/decisions.log"
-        if [ "${AWARE_DECIDER_MODE:-dry}" = advise ]; then
-          # the decider replaces the rules' concrete steps; the generic delegation advice stays
-          adv=$(jq -rn --argjson d "$d" --argjson s "$(summarize "$f" state)" '
-            ([ (if $d.effort then "call set_effort \($d.effort) now" else empty end),
-               (if $d.model then "at the next natural break call set_model \($d.model)" else empty end),
-               (if $d.compact then "call compact at the next natural break" else empty end),
-               (if $s.tier != "normal" then $s.deleg else empty end) ] | join("; ")) as $steps
-            | if $d.source != "decider" or $steps == "" then empty
-              else "[aware] tier=\($d.tier) (decider): \($steps)." end')
-          [ -n "$adv" ] && out="$(printf '%s\n' "$out" | sed -n 1p)"$'\n'"$adv"
-        fi
-      }
-    fi
-    if [ "${AWARE_QUIET:-0}" = 1 ]; then out=$(printf '%s\n' "$out" | sed -n '2,$p'); fi
+    out=$(usage_hook "$f" "$sid" "$in")
+    extra=$(AWARE_FILE="$f" python3 -I "$HERE/aware_senses.py" hook-extra "$sid" 2>/dev/null)
+    [ -n "$extra" ] && out="${out:+$out$'\n'}$extra"
     [ -n "$out" ] && printf '%s\n' "$out"
+    ;;
+  tool-hook)
+    exec python3 -I "$HERE/aware_senses.py" tool-hook
     ;;
   show)
     f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest)
     [ -n "$f" ] || { echo "no data yet (the statusline writes it after the first response; start with 'aware launch')" >&2; exit 1; }
-    if [ "${2:-}" = --json ]; then summarize "$f" state; else summarize "$f"; fi
+    if [ "${2:-}" = --json ]; then summarize "$f" state; else
+      summarize "$f"
+      [ -d "${AWARE_SENSES_DIR:-$DIR/senses}" ] && AWARE_FILE="$f" python3 -I "$HERE/aware_senses.py" list --json 2>/dev/null \
+        | jq -r '.[] | select((.level // "ok") != "ok") | "[aware] sense \(.name) (\(.level)): \(.reading)\(if (.advice // "") != "" then ". " + .advice else "" end)"'
+    fi
+    ;;
+  senses)
+    case "${2:-list}" in
+      enable|disable) exec python3 -I "$HERE/aware_senses.py" "$2" "${3:-}" ;;
+      *)
+        [ "${2:-}" = list ] && shift
+        f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest)
+        export AWARE_FILE="$f" AWARE_SESSION_ID="$([ -n "$f" ] && jq -r '.session_id // empty' "$f" 2>/dev/null)"
+        exec python3 -I "$HERE/aware_senses.py" list "${@:2}" ;;
+    esac
     ;;
   watch)
     exec python3 -I "$HERE/aware_watch.py" "$SELF" "${@:2}"
@@ -393,7 +437,7 @@ case "${1:-}" in
     shift
     watch=0; if [ "${1:-}" = --watch ]; then watch=1; shift; fi
     command -v tmux >/dev/null || { echo "aware launch needs tmux" >&2; exit 1; }
-    settings=$(jq -cn --arg bin "$SELF" '{statusLine:{type:"command",command:"\($bin) statusline"},hooks:{UserPromptSubmit:[{hooks:[{type:"command",command:"\($bin) hook"}]}]}}')
+    settings=$(jq -cn --arg bin "$SELF" '{statusLine:{type:"command",command:"\($bin) statusline"},hooks:{UserPromptSubmit:[{hooks:[{type:"command",command:"\($bin) hook"}]}],PostToolUse:[{hooks:[{type:"command",command:"\($bin) tool-hook"}]}]}}')
     # alwaysLoad: keep aware's tools in the prompt instead of deferred behind tool search; deferred,
     # Claude ignored even an explicit "call set_effort medium now" advisory (verified live, 2.1.329).
     mcp=$(jq -cn --arg bin "$SELF" '{mcpServers:{aware:{command:$bin,args:["mcp"],alwaysLoad:true}}}')
@@ -432,6 +476,8 @@ case "${1:-}" in
       (if $keep == 0 then .statusLine = {type:"command", command:"\($bin) statusline"} else . end)
       | .hooks.UserPromptSubmit = ([(.hooks.UserPromptSubmit // [])[] | select((.hooks[0].command // "") | endswith("aware hook") | not)]
                                    + [{hooks:[{type:"command", command:"\($bin) hook"}]}])
+      | .hooks.PostToolUse = ([(.hooks.PostToolUse // [])[] | select((.hooks[0].command // "") | endswith("aware tool-hook") | not)]
+                              + [{hooks:[{type:"command", command:"\($bin) tool-hook"}]}])
     ' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS" || { rm -f "$SETTINGS.tmp"; echo "install failed; settings untouched" >&2; exit 1; }
     echo "Installed globally. Backup: $SETTINGS.aware-backup. (switch/MCP tools still need 'aware launch'.)"
     ;;
@@ -441,7 +487,9 @@ case "${1:-}" in
     jq '
       (if ((.statusLine.command // "") | endswith("aware statusline")) then del(.statusLine) else . end)
       | (if .hooks.UserPromptSubmit then .hooks.UserPromptSubmit |= map(select((.hooks[0].command // "") | endswith("aware hook") | not)) else . end)
+      | (if .hooks.PostToolUse then .hooks.PostToolUse |= map(select((.hooks[0].command // "") | endswith("aware tool-hook") | not)) else . end)
       | (if .hooks.UserPromptSubmit == [] then del(.hooks.UserPromptSubmit) else . end)
+      | (if .hooks.PostToolUse == [] then del(.hooks.PostToolUse) else . end)
       | (if .hooks == {} then del(.hooks) else . end)
     ' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS" || { rm -f "$SETTINGS.tmp"; echo "uninstall failed; settings untouched" >&2; exit 1; }
     echo "Removed from $SETTINGS (backup: $SETTINGS.aware-backup)."
