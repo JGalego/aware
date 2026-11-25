@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aware: Claude Code that knows its limits</title>
+<meta name="description" content="Aware shows Claude Code its own plan usage and context, and lets it act on them: delegate, lower effort, switch model, compact.">
+<meta name="theme-color" content="#0d1117">
+<meta property="og:title" content="Aware">
+<meta property="og:description" content="Claude Code that knows its limits, and acts on them.">
+<meta property="og:image" content="https://jgalego.github.io/aware/demo-poster.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='%23d97757' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='4.5' fill='%23d97757'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --panel2: #1c2128; --line: #30363d;
+  --text: #e6edf3; --muted: #8b949e; --dim: #6e7681;
+  --accent: #d97757; --green: #3fb950; --amber: #d29922; --orange: #e0823d; --red: #f85149;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  background-image: radial-gradient(900px 420px at 50% -120px, #d9775722, transparent 70%);
+  background-repeat: no-repeat;
+}
+a { color: inherit; text-decoration: none; }
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+svg { display: block; }
+.i { width: 1em; height: 1em; fill: currentColor; flex: none; }
+.s { width: 1em; height: 1em; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+/* header */
+header { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 18px; letter-spacing: -.01em; }
+.brand svg { width: 24px; height: 24px; }
+.gh { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; padding: 6px 10px; border-radius: 8px; transition: color .15s, background .15s; }
+.gh:hover { color: var(--text); background: var(--panel); }
+.gh .i { font-size: 18px; }
+
+/* hero */
+.hero { text-align: center; padding: 56px 0 36px; }
+h1 { margin: 0 auto; font-size: clamp(30px, 4.6vw, 50px); line-height: 1.04; letter-spacing: -.03em; font-weight: 700; text-wrap: balance; }
+h1 .l { display: block; white-space: nowrap; }
+h1 em { font-style: normal; color: var(--accent); }
+.cta { display: flex; gap: 12px; justify-content: center; margin-top: 32px; flex-wrap: wrap; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 10px; font-weight: 600; font-size: 15px; border: 1px solid var(--line); transition: transform .15s, background .15s, border-color .15s; }
+.btn:hover { transform: translateY(-1px); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #1a0f0a; }
+.btn.primary:hover { background: #e48a6c; }
+.btn.ghost:hover { background: var(--panel); border-color: #484f58; }
+.btn .i, .btn .s { font-size: 17px; }
+
+.frame { margin: 8px auto 0; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: #0d1117;
+  box-shadow: 0 30px 80px -30px #000, 0 0 0 1px #ffffff08, 0 0 120px -40px #d9775766; }
+.frame video { width: 100%; height: auto; display: block; }
+
+/* sections */
+section { padding: 88px 0 0; }
+.label { font: 600 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); margin: 0 0 20px; text-align: center; }
+
+/* tier demo */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 28px; }
+.pills { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.pill { text-align: center; padding: 9px 6px; border-radius: 9px; border: 1px solid var(--line); color: var(--dim);
+  font: 600 13px/1 var(--mono); letter-spacing: .02em; transition: all .25s; background: transparent; }
+.pill.on { color: var(--c); border-color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); }
+.slider { position: relative; margin: 30px 4px 6px; }
+.slider-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px; font: 13px var(--mono); color: var(--muted); }
+.slider-head b { font-size: 28px; font-weight: 600; color: var(--c, var(--green)); letter-spacing: -.02em; transition: color .25s; }
+.slider-head .hint { color: var(--dim); }
+input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 12px; margin: 0; background: transparent; cursor: grab; display: block; }
+input[type=range]:active { cursor: grabbing; }
+input[type=range]::-webkit-slider-runnable-track { height: 12px; border-radius: 6px;
+  background:
+    linear-gradient(90deg, var(--c) var(--p), transparent var(--p)),
+    linear-gradient(90deg, #3fb95040 0 50%, #d2992240 50% 80%, #e0823d40 80% 95%, #f8514945 95%); }
+input[type=range]::-moz-range-track { height: 12px; border-radius: 6px;
+  background:
+    linear-gradient(90deg, var(--c) var(--p), transparent var(--p)),
+    linear-gradient(90deg, #3fb95040 0 50%, #d2992240 50% 80%, #e0823d40 80% 95%, #f8514945 95%); }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 24px; height: 24px; margin-top: -6px; border-radius: 50%;
+  background: #fff; border: 3px solid var(--c); box-shadow: 0 2px 10px #0008; transition: border-color .25s; }
+input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #fff; border: 3px solid var(--c); box-shadow: 0 2px 10px #0008; }
+input[type=range]:focus-visible { outline: none; }
+input[type=range]:focus-visible::-webkit-slider-thumb { outline: 2px solid #fff; outline-offset: 2px; }
+.ticks { position: relative; height: 22px; margin-top: 10px; font: 11px var(--mono); color: var(--dim); }
+.ticks span { position: absolute; transform: translateX(-50%); }
+.ticks span::before { content: ""; position: absolute; left: 50%; top: -8px; width: 1px; height: 5px; background: var(--line); }
+
+.cols { display: grid; grid-template-columns: 1.55fr 1fr; gap: 16px; margin-top: 24px; }
+.box { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; min-width: 0; }
+.box h3 { margin: 0 0 12px; font: 600 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+.term { font: 13px/1.65 var(--mono); color: var(--muted); min-height: 9.2em; }
+.term .seg { white-space: nowrap; }
+.term .ln { display: block; }
+.term .ln + .ln { margin-top: .7em; }
+.term .t { color: var(--c); font-weight: 600; }
+.term .tag { color: var(--dim); }
+.term .quiet { color: var(--dim); font-style: italic; }
+.term .ln { animation: in .3s ease; }
+@keyframes in { from { opacity: 0; transform: translateY(3px); } }
+.chips { display: grid; gap: 10px; }
+.chip { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); font: 13px var(--mono); }
+.chip span:first-child { color: var(--dim); }
+.chip b { font-weight: 600; transition: color .25s; }
+.chip.flash { animation: flash .7s ease; }
+@keyframes flash { 0% { border-color: var(--accent); background: #d9775726; } 100% { border-color: var(--line); background: var(--panel); } }
+.act { margin-top: 12px; font: 13px var(--mono); color: var(--accent); min-height: 3.4em; }
+.act div { animation: in .3s ease; }
+
+/* loop */
+.loop { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr; align-items: stretch; gap: 10px; }
+.node { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px 18px; text-align: center; animation: lit 6s ease-in-out infinite; animation-delay: calc(var(--n) * 1.5s); }
+.node .s { font-size: 30px; color: var(--accent); margin: 0 auto 12px; }
+.node b { display: block; font-size: 17px; letter-spacing: -.01em; }
+.node small { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px 12px; margin-top: 6px; font: 12px/1.4 var(--mono); color: var(--muted); }
+.node small span { white-space: nowrap; }
+.arrow { align-self: center; color: var(--dim); font-size: 20px; }
+@keyframes lit { 0%, 22% { border-color: var(--accent); background: #d9775716; box-shadow: 0 0 40px -12px #d97757aa; } 30%, 100% { border-color: var(--line); background: var(--panel); box-shadow: none; } }
+.loop-back { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 16px; color: var(--dim); font: 12px var(--mono); }
+.loop-back .s { font-size: 16px; }
+
+/* install */
+.tabs { display: flex; gap: 4px; padding: 5px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; width: fit-content; margin: 0 auto 18px; max-width: 100%; overflow-x: auto; }
+.tab { display: inline-flex; align-items: center; gap: 9px; padding: 9px 16px; border-radius: 8px; border: 0; background: transparent; color: var(--muted); font: 600 14px var(--sans); cursor: pointer; white-space: nowrap; transition: color .15s, background .15s; }
+.tab .i { font-size: 17px; }
+.tab:hover { color: var(--text); }
+.tab[aria-selected=true] { background: var(--bg); color: var(--text); box-shadow: 0 0 0 1px var(--line); }
+.tab[aria-selected=true] .i { color: var(--accent); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.code { position: relative; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 20px 64px 20px 22px; font: 14px/1.9 var(--mono); }
+.code pre { margin: 0; overflow-x: auto; white-space: pre; scrollbar-width: thin; }
+.code .p { color: var(--dim); user-select: none; }
+.code .cmd { color: var(--accent); }
+.code .url { color: var(--muted); }
+.code .then { color: var(--dim); }
+.copy { position: absolute; top: 12px; right: 12px; width: 36px; height: 36px; display: grid; place-items: center; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; transition: all .15s; }
+.copy:hover { color: var(--text); border-color: #484f58; }
+.copy .s { font-size: 17px; }
+.copy.ok { color: var(--green); border-color: var(--green); }
+
+footer { margin-top: 96px; padding: 28px 0 44px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: var(--dim); font-size: 14px; }
+footer a:hover { color: var(--text); }
+footer nav { display: flex; gap: 20px; }
+
+@media (max-width: 760px) {
+  h1 { font-size: clamp(32px, 9vw, 44px); max-width: 16ch; }
+  h1 .l { display: inline; white-space: normal; }
+  .hero { padding-top: 32px; }
+  section { padding-top: 64px; }
+  .card { padding: 18px; }
+  .cols { grid-template-columns: 1fr; }
+  .loop { grid-template-columns: 1fr 1fr; }
+  .arrow { display: none; }
+  .pill { font-size: 11px; }
+  .tab { padding: 9px 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .node { animation: none; }
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="linux" viewBox="0 0 24 24"><path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.132 1.884 1.071.771-.06 1.592-.536 2.257-1.306.631-.765 1.683-1.084 2.378-1.503.348-.199.629-.469.649-.853.023-.4-.2-.811-.714-1.376v-.097l-.003-.003c-.17-.2-.25-.535-.338-.926-.085-.401-.182-.786-.492-1.046h-.003c-.059-.054-.123-.067-.188-.135a.357.357 0 00-.19-.064c.431-1.278.264-2.55-.173-3.694-.533-1.41-1.465-2.638-2.175-3.483-.796-1.005-1.576-1.957-1.56-3.368.026-2.152.236-6.133-3.544-6.139zm.529 3.405h.013c.213 0 .396.062.584.198.19.135.33.332.438.533.105.259.158.459.166.724 0-.02.006-.04.006-.06v.105a.086.086 0 01-.004-.021l-.004-.024a1.807 1.807 0 01-.15.706.953.953 0 01-.213.335.71.71 0 00-.088-.042c-.104-.045-.198-.064-.284-.133a1.312 1.312 0 00-.22-.066c.05-.06.146-.133.183-.198.053-.128.082-.264.088-.402v-.02a1.21 1.21 0 00-.061-.4c-.045-.134-.101-.2-.183-.333-.084-.066-.167-.132-.267-.132h-.016c-.093 0-.176.03-.262.132a.8.8 0 00-.205.334 1.18 1.18 0 00-.09.4v.019c.002.089.008.179.02.267-.193-.067-.438-.135-.607-.202a1.635 1.635 0 01-.018-.2v-.02a1.772 1.772 0 01.15-.768c.082-.22.232-.406.43-.533a.985.985 0 01.594-.2zm-2.962.059h.036c.142 0 .27.048.399.135.146.129.264.288.344.465.09.199.14.4.153.667v.004c.007.134.006.2-.002.266v.08c-.03.007-.056.018-.083.024-.152.055-.274.135-.393.2.012-.09.013-.18.003-.267v-.015c-.012-.133-.04-.2-.082-.333a.613.613 0 00-.166-.267.248.248 0 00-.183-.064h-.021c-.071.006-.13.04-.186.132a.552.552 0 00-.12.27.944.944 0 00-.023.33v.015c.012.135.037.2.08.334.046.134.098.2.166.268.01.009.02.018.034.024-.07.057-.117.07-.176.136a.304.304 0 01-.131.068 2.62 2.62 0 01-.275-.402 1.772 1.772 0 01-.155-.667 1.759 1.759 0 01.08-.668 1.43 1.43 0 01.283-.535c.128-.133.26-.2.418-.2zm1.37 1.706c.332 0 .733.065 1.216.399.293.2.523.269 1.052.468h.003c.255.136.405.266.478.399v-.131a.571.571 0 01.016.47c-.123.31-.516.643-1.063.842v.002c-.268.135-.501.333-.775.465-.276.135-.588.292-1.012.267a1.139 1.139 0 01-.448-.067 3.566 3.566 0 01-.322-.198c-.195-.135-.363-.332-.612-.465v-.005h-.005c-.4-.246-.616-.512-.686-.71-.07-.268-.005-.47.193-.6.224-.135.38-.271.483-.336.104-.074.143-.102.176-.131h.002v-.003c.169-.202.436-.47.839-.601.139-.036.294-.065.466-.065zm2.8 2.142c.358 1.417 1.196 3.475 1.735 4.473.286.534.855 1.659 1.102 3.024.156-.005.33.018.513.064.646-1.671-.546-3.467-1.089-3.966-.22-.2-.232-.335-.123-.335.59.534 1.365 1.572 1.646 2.757.13.535.16 1.104.021 1.67.067.028.135.06.205.067 1.032.534 1.413.938 1.23 1.537v-.043c-.06-.003-.12 0-.18 0h-.016c.151-.467-.182-.825-1.065-1.224-.915-.4-1.646-.336-1.77.465-.008.043-.013.066-.018.135-.068.023-.139.053-.209.064-.43.268-.662.669-.793 1.187-.13.533-.17 1.156-.205 1.869v.003c-.02.334-.17.838-.319 1.35-1.5 1.072-3.58 1.538-5.348.334a2.645 2.645 0 00-.402-.533 1.45 1.45 0 00-.275-.333c.182 0 .338-.03.465-.067a.615.615 0 00.314-.334c.108-.267 0-.697-.345-1.163-.345-.467-.931-.995-1.788-1.521-.63-.4-.986-.87-1.15-1.396-.165-.534-.143-1.085-.015-1.645.245-1.07.873-2.11 1.274-2.763.107-.065.037.135-.408.974-.396.751-1.14 2.497-.122 3.854a8.123 8.123 0 01.647-2.876c.564-1.278 1.743-3.504 1.836-5.268.048.036.217.135.289.202.218.133.38.333.59.465.21.201.477.335.876.335.039.003.075.006.11.006.412 0 .73-.134.997-.268.29-.134.52-.334.74-.4h.005c.467-.135.835-.402 1.044-.7zm2.185 8.958c.037.6.343 1.245.882 1.377.588.134 1.434-.333 1.791-.765l.211-.01c.315-.007.577.01.847.268l.003.003c.208.199.305.53.391.876.085.4.154.78.409 1.066.486.527.645.906.636 1.14l.003-.007v.018l-.003-.012c-.015.262-.185.396-.498.595-.63.401-1.746.712-2.457 1.57-.618.737-1.37 1.14-2.036 1.191-.664.053-1.237-.2-1.574-.898l-.005-.003c-.21-.4-.12-1.025.056-1.69.176-.668.428-1.344.463-1.897.037-.714.076-1.335.195-1.814.12-.465.308-.797.641-.984l.045-.022zm-10.814.049h.01c.053 0 .105.005.157.014.376.055.706.333 1.023.752l.91 1.664.003.003c.243.533.754 1.064 1.189 1.637.434.598.77 1.131.729 1.57v.006c-.057.744-.48 1.148-1.125 1.294-.645.135-1.52.002-2.395-.464-.968-.536-2.118-.469-2.857-.602-.369-.066-.61-.2-.723-.4-.11-.2-.113-.602.123-1.23v-.004l.002-.003c.117-.334.03-.752-.027-1.118-.055-.401-.083-.71.043-.94.16-.334.396-.4.69-.533.294-.135.64-.202.915-.47h.002v-.002c.256-.268.445-.601.668-.838.19-.201.38-.336.663-.336zm7.159-9.074c-.435.201-.945.535-1.488.535-.542 0-.97-.267-1.28-.466-.154-.134-.28-.268-.373-.335-.164-.134-.144-.333-.074-.333.109.016.129.134.199.2.096.066.215.2.36.333.292.2.68.467 1.167.467.485 0 1.053-.267 1.398-.466.195-.135.445-.334.648-.467.156-.136.149-.267.279-.267.128.016.034.134-.147.332a8.097 8.097 0 01-.69.468zm-1.082-1.583V5.64c-.006-.02.013-.042.029-.05.074-.043.18-.027.26.004.063 0 .16.067.15.135-.006.049-.085.066-.135.066-.055 0-.092-.043-.141-.068-.052-.018-.146-.008-.163-.065zm-.551 0c-.02.058-.113.049-.166.066-.047.025-.086.068-.14.068-.05 0-.13-.02-.136-.068-.01-.066.088-.133.15-.133.08-.031.184-.047.259-.005.019.009.036.03.03.05v.02h.003z"/></symbol>
+  <symbol id="apple" viewBox="0 0 24 24"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></symbol>
+  <symbol id="windows" viewBox="0 0 24 24"><path d="M0,0H11.377V11.372H0ZM12.623,0H24V11.372H12.623ZM0,12.623H11.377V24H0Zm12.623,0H24V24H12.623"/></symbol>
+  <symbol id="git" viewBox="0 0 24 24"><path d="M13.09 23.549a1.54 1.54 0 0 1-2.18 0L.451 13.089a1.54 1.54 0 0 1 0-2.179l7.191-7.19 2.733 2.733a1.85 1.85 0 0 0 .964 2.326v6.66a1.849 1.849 0 1 0 1.54 0V8.957l2.508 2.508a1.85 1.85 0 1 0 1.09-1.09l-2.634-2.634a1.85 1.85 0 0 0-2.378-2.377L8.73 2.63 10.91.451a1.54 1.54 0 0 1 2.179 0l10.459 10.46a1.54 1.54 0 0 1 0 2.179z"/></symbol>
+  <symbol id="github" viewBox="0 0 24 24"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></symbol>
+</svg>
+
+<div class="wrap">
+  <header>
+    <a class="brand" href="#top" aria-label="Aware">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="11" fill="none" stroke="#d97757" stroke-width="3"/><circle cx="16" cy="16" r="4.5" fill="#d97757"/></svg>
+      aware
+    </a>
+    <a class="gh" href="https://github.com/JGalego/aware"><svg class="i"><use href="#github"/></svg>GitHub</a>
+  </header>
+
+  <main id="top">
+    <div class="hero">
+      <h1><span class="l">Claude Code that knows its limits,</span> <span class="l">and <em>acts on them.</em></span></h1>
+      <div class="cta">
+        <a class="btn primary" href="#install"><svg class="s" viewBox="0 0 24 24"><path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/></svg>Install</a>
+        <a class="btn ghost" href="https://github.com/JGalego/aware"><svg class="i"><use href="#github"/></svg>Source</a>
+      </div>
+    </div>
+
+    <div class="frame">
+      <video src="demo.mp4" poster="demo-poster.png" autoplay muted loop playsinline preload="metadata" aria-label="A live dashboard beside Claude Code: the context fills, the tier climbs to conserve, Claude lowers its own effort and compacts, and the tier drops back to normal."></video>
+    </div>
+
+    <section id="try">
+      <p class="label">Try it</p>
+      <div class="card" id="demo" style="--c: var(--green); --p: 12%">
+        <div class="pills" aria-hidden="true">
+          <div class="pill" data-t="normal" style="--c: var(--green)">normal</div>
+          <div class="pill" data-t="lean" style="--c: var(--amber)">lean</div>
+          <div class="pill" data-t="conserve" style="--c: var(--orange)">conserve</div>
+          <div class="pill" data-t="critical" style="--c: var(--red)">critical</div>
+        </div>
+        <div class="slider">
+          <div class="slider-head"><span>5h plan used <span class="hint" id="hint">· drag</span></span><b id="val">12%</b></div>
+          <input id="range" type="range" min="0" max="100" value="12" aria-label="5-hour plan usage, percent">
+          <div class="ticks"><span style="left:50%">50</span><span style="left:80%">80</span><span style="left:95%">95</span></div>
+        </div>
+        <div class="cols">
+          <div class="box">
+            <h3>Claude sees</h3>
+            <div class="term" id="term" aria-live="polite"></div>
+          </div>
+          <div class="box">
+            <h3>Claude does</h3>
+            <div class="chips">
+              <div class="chip" id="c-model"><span>model</span><b></b></div>
+              <div class="chip" id="c-effort"><span>effort</span><b></b></div>
+            </div>
+            <div class="act" id="act"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <p class="label">The loop</p>
+      <div class="loop">
+        <div class="node" style="--n:0"><svg class="s" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><b>Sense</b><small><span>usage</span><span>pace</span><span>context</span></small></div>
+        <div class="arrow"><svg class="s" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></div>
+        <div class="node" style="--n:1"><svg class="s" viewBox="0 0 24 24"><path d="M6 3v12"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><b>Decide</b><small><span>tier</span><span>cache cost</span></small></div>
+        <div class="arrow"><svg class="s" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></div>
+        <div class="node" style="--n:2"><svg class="s" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b>Tell</b><small><span>one line</span><span>only on change</span></small></div>
+        <div class="arrow"><svg class="s" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></div>
+        <div class="node" style="--n:3"><svg class="s" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></svg><b>Act</b><small><span>/effort</span><span>/model</span><span>/compact</span></small></div>
+      </div>
+      <div class="loop-back"><svg class="s" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5"/></svg>and measure what it saved</div>
+    </section>
+
+    <section id="install">
+      <p class="label">Install</p>
+      <div class="tabs" role="tablist" aria-label="Operating system">
+        <button class="tab" role="tab" id="tab-linux" aria-controls="p-linux" data-os="linux"><svg class="i"><use href="#linux"/></svg>Linux</button>
+        <button class="tab" role="tab" id="tab-macos" aria-controls="p-macos" data-os="macos"><svg class="i"><use href="#apple"/></svg>macOS</button>
+        <button class="tab" role="tab" id="tab-windows" aria-controls="p-windows" data-os="windows"><svg class="i"><use href="#windows"/></svg>Windows</button>
+        <button class="tab" role="tab" id="tab-source" aria-controls="p-source" data-os="source"><svg class="i"><use href="#git"/></svg>Source</button>
+      </div>
+
+      <div class="code" role="tabpanel" id="p-linux" aria-labelledby="tab-linux" data-copy="curl -fsSL https://raw.githubusercontent.com/JGalego/aware/main/install.sh | bash">
+        <pre><span class="p">$ </span><span class="cmd">curl</span> -fsSL <span class="url">https://raw.githubusercontent.com/JGalego/aware/main/install.sh</span> | <span class="cmd">bash</span>
+<span class="p">$ </span><span class="then">aware launch --watch</span></pre>
+        <button class="copy" aria-label="Copy command"></button>
+      </div>
+      <div class="code" role="tabpanel" id="p-macos" aria-labelledby="tab-macos" hidden data-copy="brew install jq tmux && curl -fsSL https://raw.githubusercontent.com/JGalego/aware/main/install.sh | bash">
+        <pre><span class="p">$ </span><span class="cmd">brew</span> install jq tmux &amp;&amp; <span class="cmd">curl</span> -fsSL <span class="url">https://raw.githubusercontent.com/JGalego/aware/main/install.sh</span> | <span class="cmd">bash</span>
+<span class="p">$ </span><span class="then">aware launch --watch</span></pre>
+        <button class="copy" aria-label="Copy command"></button>
+      </div>
+      <div class="code" role="tabpanel" id="p-windows" aria-labelledby="tab-windows" hidden data-copy="irm https://raw.githubusercontent.com/JGalego/aware/main/install.ps1 | iex">
+        <pre><span class="p">PS&gt; </span><span class="cmd">irm</span> <span class="url">https://raw.githubusercontent.com/JGalego/aware/main/install.ps1</span> | <span class="cmd">iex</span>
+<span class="p">$ </span><span class="then">aware launch --watch</span><span class="p">   # inside WSL</span></pre>
+        <button class="copy" aria-label="Copy command"></button>
+      </div>
+      <div class="code" role="tabpanel" id="p-source" aria-labelledby="tab-source" hidden data-copy="git clone https://github.com/JGalego/aware &amp;&amp; ln -s &quot;$PWD/aware/aware&quot; ~/.local/bin/aware">
+        <pre><span class="p">$ </span><span class="cmd">git</span> clone <span class="url">https://github.com/JGalego/aware</span> &amp;&amp; <span class="cmd">ln</span> -s "$PWD/aware/aware" ~/.local/bin/aware
+<span class="p">$ </span><span class="then">aware launch --watch</span></pre>
+        <button class="copy" aria-label="Copy command"></button>
+      </div>
+
+    </section>
+  </main>
+
+  <footer>
+    <span>MIT · tokens not free</span>
+    <nav><a href="https://github.com/JGalego/aware">GitHub</a><a href="https://github.com/JGalego/aware#readme">Docs</a></nav>
+  </footer>
+</div>
+
+<script>
+(() => {
+  /* ---------- tier demo ---------- */
+  const T = {
+    normal:   { c: 'var(--green)',  model: 'opus',   effort: 'high',   act: [] },
+    lean:     { c: 'var(--amber)',  model: 'opus',   effort: 'high',   act: ['▸ delegate bulk work to haiku'] },
+    conserve: { c: 'var(--orange)', model: 'sonnet', effort: 'medium', act: ['▸ set_effort medium', '▸ set_model sonnet'] },
+    critical: { c: 'var(--red)',    model: 'haiku',  effort: 'low',    act: ['▸ set_effort low', '▸ ask the user'] },
+  };
+  const advice = {
+    lean:     'delegate to cheaper-model subagents; keep replies and tool output short',
+    conserve: 'call set_effort medium now; at the next natural break call set_model sonnet and compact',
+    critical: 'finish the current step, write a short state summary, and ask the user before starting anything new',
+  };
+  const tierOf = u => u >= 95 ? 'critical' : u >= 80 ? 'conserve' : u >= 50 ? 'lean' : 'normal';
+
+  const $ = id => document.getElementById(id);
+  const demo = $('demo'), range = $('range'), val = $('val'), term = $('term'), act = $('act');
+  const chips = { model: $('c-model'), effort: $('c-effort') };
+  let tier = null, auto = true;
+
+  function render(u) {
+    demo.style.setProperty('--p', u + '%');
+    val.textContent = Math.round(u) + '%';
+    const t = tierOf(u), s = T[t];
+    demo.style.setProperty('--c', s.c);
+    val.style.color = s.c;
+    const pct = Math.round(u);
+    // keep the readout's number live; rebuild the rest only when the tier changes
+    if (t === tier) { const n = term.querySelector('.n'); if (n) n.textContent = pct + '%'; return; }
+    tier = t;
+    document.querySelectorAll('.pill').forEach(p => p.classList.toggle('on', p.dataset.t === t));
+    const sg = x => `<span class="seg">${x}</span>`;
+    const readout = `<span class="ln"><span class="tag">[usage]</span> ${sg('5h <span class="n">' + pct + '%</span>')} | ${sg('7d 19%')} | ${sg('ctx 37%')} | ${sg(s.model)} | ${sg('effort ' + s.effort)} | ${sg('cache warm')} | ${sg('$1.42')}</span>`;
+    const tierLine = t === 'normal'
+      ? `<span class="ln quiet">all clear. aware says nothing.</span>`
+      : `<span class="ln"><span class="tag">[aware]</span> <span class="t">tier=${t}</span>: ${advice[t]}.</span>`;
+    term.innerHTML = readout + tierLine;
+    for (const k of ['model', 'effort']) {
+      const el = chips[k], b = el.querySelector('b'), v = s[k];
+      if (b.textContent !== v) { b.textContent = v; el.classList.remove('flash'); void el.offsetWidth; if (b.dataset.init) el.classList.add('flash'); }
+      b.dataset.init = '1'; b.style.color = s.c;
+    }
+    act.innerHTML = s.act.map(a => `<div>${a}</div>`).join('');
+  }
+  range.addEventListener('input', () => { stop(); render(+range.value); });
+  function stop() { auto = false; $('hint').textContent = ''; }
+  ['pointerdown', 'keydown', 'touchstart'].forEach(e => range.addEventListener(e, stop, { passive: true }));
+
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) { range.value = 86; render(86); stop(); $('hint').textContent = '· drag'; }
+  else {
+    render(12);
+    // sweep 12 -> 100 slowly, hold, snap back; stops the moment the visitor touches the slider
+    let started = false, t0 = 0;
+    const UP = 11000, HOLD = 1600, DOWN = 900;
+    const frame = now => {
+      if (!auto) return;
+      if (!t0) t0 = now;
+      const e = (now - t0) % (UP + HOLD + DOWN);
+      let u;
+      if (e < UP) u = 12 + 88 * (e / UP);
+      else if (e < UP + HOLD) u = 100;
+      else u = 100 - 88 * ((e - UP - HOLD) / DOWN);
+      range.value = u; render(u);
+      requestAnimationFrame(frame);
+    };
+    new IntersectionObserver((en, io) => {
+      if (en[0].isIntersecting && !started) { started = true; requestAnimationFrame(frame); io.disconnect(); }
+    }, { threshold: .4 }).observe(demo);
+  }
+
+  /* ---------- install tabs ---------- */
+  const tabs = [...document.querySelectorAll('.tab')];
+  function select(os, focus) {
+    tabs.forEach(t => {
+      const on = t.dataset.os === os;
+      t.setAttribute('aria-selected', on);
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+      if (on && focus) t.focus();
+    });
+  }
+  tabs.forEach((t, i) => {
+    t.addEventListener('click', () => select(t.dataset.os));
+    t.addEventListener('keydown', e => {
+      const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+      if (d) { e.preventDefault(); select(tabs[(i + d + tabs.length) % tabs.length].dataset.os, true); }
+    });
+  });
+  const ua = navigator.userAgent || '';
+  select(/Windows/i.test(ua) ? 'windows' : /Mac|iPhone|iPad/i.test(ua) ? 'macos' : 'linux');
+
+  /* ---------- copy ---------- */
+  const COPY = '<svg class="s" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>';
+  const CHECK = '<svg class="s" viewBox="0 0 24 24"><path d="m5 12 5 5L20 7"/></svg>';
+  document.querySelectorAll('.copy').forEach(b => {
+    b.innerHTML = COPY;
+    b.addEventListener('click', async () => {
+      const text = b.parentElement.dataset.copy;
+      try { await navigator.clipboard.writeText(text); }
+      catch { const a = document.createElement('textarea'); a.value = text; document.body.append(a); a.select(); document.execCommand('copy'); a.remove(); }
+      b.innerHTML = CHECK; b.classList.add('ok');
+      setTimeout(() => { b.innerHTML = COPY; b.classList.remove('ok'); }, 1600);
+    });
+  });
+})();
+</script>
+</body>
+</html>
