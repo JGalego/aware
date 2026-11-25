@@ -26,7 +26,7 @@ Signals. A "[usage]" line arrives with a prompt whenever something meaningful ch
 Cheapest moves first:
 1. Delegate bulk work to subagents on a cheaper model: only their short report enters this context. Ask them for conclusions, not dumps. Match the model to the task: "{CHEAP}" for mechanical work (search, file reads, extraction, summaries){MID_RULE} Keep the hardest reasoning in this session. A weak subagent answer that you must redo costs more than it saved, so step up a model when a result looks thin.
 2. Keep your own reads and outputs small: read the lines you need, don't re-read what you already have, keep replies short.
-3. Use effort as the main knob (set_effort): lower it for routine steps and raise it only for genuinely hard reasoning, saying why.
+3. Use effort as the main knob (set_effort): lower it for routine steps and raise it only for genuinely hard reasoning, saying why. On current models with a subscription or API key an effort change keeps the prompt cache; when the advice says it drops the cache here (older models, Bedrock/Vertex, gateways), treat it like a model switch and do it at a natural break.
 4. Switch model (set_model) only at a natural break, when substantial work remains. A switch re-reads the whole context uncached, so it is cheapest when context is small (early on, or right after compact) or when the cache is already cold. Never switch back and forth; stepping up to a costlier model needs a stated reason.
 5. Compact (compact) when context is high and you reach a natural break (a task done, before a new phase). It replaces the history with a summary, so first state the goal, next steps and key file paths in your reply.
 
@@ -58,7 +58,8 @@ TOOLS = [
     {
         "name": "set_effort",
         "description": "Change THIS session's effort level (types /effort <level> into the terminal). "
-                       "Takes effect after the current turn ends. Lower effort saves tokens.",
+                       "Takes effect after the current turn ends. Lower effort saves tokens. It keeps the prompt cache only on some "
+                       "models and setups; the aware advice says when it does not, and then it belongs at a natural break.",
         "inputSchema": {
             "type": "object",
             "properties": {"level": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}},

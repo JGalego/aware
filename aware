@@ -40,6 +40,8 @@
 #   AWARE_AUTOCONFIRM=1  press Enter on the "Switch model?" dialog for you (only when it names the new model)
 #   AWARE_CONFIRM_WAIT=600  seconds the auto-confirm watcher waits for that dialog
 #   AWARE_KEEP_DEFAULT=1    restore your default model in settings.json after a switch (0 = leave it)
+#   AWARE_EFFORT_CACHE=auto  does an effort change keep the prompt cache? auto = only on Fable 5.1+, Opus/Sonnet/Haiku 5.5+ and
+#                           not on Bedrock/Vertex/Foundry or a custom ANTHROPIC_BASE_URL; yes/no force the answer
 set -u
 
 SELF=$(readlink -f "$0")
@@ -51,6 +53,13 @@ CRIT="${AWARE_CRIT:-95}"
 CTX_LEAN="${AWARE_CTX_LEAN:-50}"
 CTX_WARN="${AWARE_CTX_WARN:-70}"
 RESET_SOON="${AWARE_RESET_SOON:-15}"
+# Claude Code keeps the prompt cache across an effort change only on some models and only when talking to
+# Anthropic directly (API key or subscription); cloud providers and gateways re-read everything.
+EFFORT_CACHE="${AWARE_EFFORT_CACHE:-auto}"
+if [ "$EFFORT_CACHE" = auto ]; then
+  if [ -n "${CLAUDE_CODE_USE_BEDROCK:-}${CLAUDE_CODE_USE_VERTEX:-}${CLAUDE_CODE_USE_FOUNDRY:-}" ]; then EFFORT_CACHE=provider
+  elif [ -n "${ANTHROPIC_BASE_URL:-}" ] && [[ "${ANTHROPIC_BASE_URL%/}" != https://api.anthropic.com ]]; then EFFORT_CACHE=provider; fi
+fi
 MODELS="${AWARE_MODELS:-haiku sonnet opus}"
 EFFORTS="${AWARE_EFFORTS:-low medium high xhigh max}"
 SETTINGS="${AWARE_SETTINGS:-$HOME/.claude/settings.json}"
@@ -81,7 +90,7 @@ with_limits() {
 summarize() {
   with_limits "$1" | jq -r --arg mode "${2:-lines}" --arg models "$MODELS" --argjson now "$NOW" \
         --argjson lean "$LEAN" --argjson warn "$WARN" --argjson crit "$CRIT" \
-        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" --argjson soon "$RESET_SOON" '
+        --argjson ctxlean "$CTX_LEAN" --argjson ctxwarn "$CTX_WARN" --argjson soon "$RESET_SOON" --arg effcache "$EFFORT_CACHE" '
     def pct:  if . == null then "?" else "\(floor)%" end;
     def day:  strflocaltime("%a %H:%M");
     def dec1: (. * 10 + 0.5 | floor) as $t | "\($t / 10 | floor).\($t % 10)";
@@ -116,12 +125,24 @@ summarize() {
        else "normal" end) as $tier
     | (.model.id // .model.display_name // "?") as $model
     | (.effort.level // "n/a") as $effort
+        # Does an effort change keep the prompt cache here? Only on Fable 5.1+ and Opus/Sonnet/Haiku 5.5+ (docs:
+        # prompt caching), and not behind Bedrock/Vertex/Foundry or a gateway. Unknown models count as "no".
+        | (if $effcache == "yes" then true
+           elif $effcache != "auto" then false
+           else ([$model | ascii_downcase | capture("(?<f>opus|sonnet|haiku|fable)[- ](?<a>[0-9]+)[-.](?<b>[0-9]+)")] | .[0]) as $v
+             | ($v != null) and (($v.a | tonumber) * 100 + ($v.b | tonumber)) >= (if $v.f == "fable" then 501 else 505 end)
+           end) as $effkeeps
+        | (if $warm == false then "costs nothing extra now: the cache is cold"
+           elif $recache == 0 then "costs nothing extra now: nothing is cached yet"
+           elif $recache != null then "re-reads ~\($recache | ktok) tokens uncached"
+           else "re-reads the whole context uncached" end) as $switchcost
         # Concrete steps (vague advice gets ignored, verified live): name the exact call when the
         # current effort or model is above what the tier calls for.
         | {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4} as $rank
         | ({"lean": "high", "conserve": "medium", "critical": "low"}[$tier]) as $teff
-        | (if $teff != null and ($rank[$effort] // -1) > $rank[$teff]
-           then "call set_effort \($teff) now (currently \($effort); effort changes keep the cache)" else null end) as $effstep
+        | (if $teff == null or ($rank[$effort] // -1) <= $rank[$teff] then null
+           elif $effkeeps then "call set_effort \($teff) now (currently \($effort); effort changes keep the cache)"
+           else "at the next natural break call set_effort \($teff) (currently \($effort); on this setup an effort change drops the prompt cache and \($switchcost))" end) as $effstep
         # Reset proximity: when every plan window at or above the lean limit resets within $soon minutes,
         # waiting beats downgrading (a switch costs a cache re-read; the limit is about to refill).
         | ([{k: "5h", w: $h5}, {k: "7d", w: $d7}] | map(select((.w.u // 0) >= $lean))) as $hot
@@ -152,7 +173,7 @@ summarize() {
         {tier: $tier,
          h5: {u: $h5.u, p: $h5.p}, d7: {u: $d7.u, p: $d7.p},
          ctx: $c, ctx_tokens: .context_window.total_input_tokens,
-         model: $model, effort: $effort, warm: $warm, recache: $recache,
+         model: $model, effort: $effort, warm: $warm, recache: $recache, effkeeps: $effkeeps,
          models: $ml, deleg: $deleg,
          limits: {lean: $lean, warn: $warn, crit: $crit, ctx_lean: $ctxlean, ctx_warn: $ctxwarn},
          rules: {effort: (if $effstep != null then $teff else null end),
@@ -165,10 +186,6 @@ summarize() {
            (if ($h5.p // 0) > 1 then "5h pace \($h5.p | dec1)x, out ~\($h5.out | day)" else empty end),
            (if ($d7.p // 0) > 1 then "7d pace \($d7.p | dec1)x, out ~\($d7.out | day)" else empty end),
            (if $c0 >= $ctxlean or $c0 >= $ctxwarn then "ctx \($c | pct)" else empty end) ] | join("; ")) as $why
-        | (if $warm == false then "costs nothing extra now: the cache is cold"
-           elif $recache == 0 then "costs nothing extra now: nothing is cached yet"
-           elif $recache != null then "re-reads ~\($recache | ktok) tokens uncached"
-           else "re-reads the whole context uncached" end) as $switchcost
         | (if $tmodel == null then null
            else "at the next natural break call set_model \($tmodel) (a switch \($switchcost))" end) as $modstep
         | (if $tier == "lean" then
@@ -313,7 +330,7 @@ usage_hook() {
       if [ "${AWARE_DECIDER_MODE:-dry}" = advise ]; then
         # the decider replaces the rules' concrete steps; the generic delegation advice stays
         adv=$(jq -rn --argjson d "$d" --argjson s "$(summarize "$f" state)" '
-          ([ (if $d.effort then "call set_effort \($d.effort) now" else empty end),
+          ([ (if $d.effort then (if $s.effkeeps then "call set_effort \($d.effort) now" else "at the next natural break call set_effort \($d.effort) (on this setup it drops the prompt cache)" end) else empty end),
              (if $d.model then "at the next natural break call set_model \($d.model)" else empty end),
              (if $d.compact then "call compact at the next natural break" else empty end),
              (if $s.tier != "normal" then $s.deleg else empty end) ] | join("; ")) as $steps
@@ -337,7 +354,8 @@ case "${1:-}" in
     # cost history, one line per change: the hook compares cost per turn before/after aware's own moves
     hist="$DIR/$sid.hist"
     cost=$(printf '%s' "$in" | jq -r '.cost.total_cost_usd // 0')
-    [ "$(tail -n 1 "$hist" 2>/dev/null | cut -d' ' -f2)" = "$cost" ] || printf '%s %s\n' "$NOW" "$cost" >> "$hist"
+    misses=$(printf '%s' "$in" | jq -r '.prompt_cache.misses // 0')
+    [ "$(tail -n 1 "$hist" 2>/dev/null | cut -d' ' -f2)" = "$cost" ] || printf '%s %s %s\n' "$NOW" "$cost" "$misses" >> "$hist"
     [ "$(wc -l < "$hist")" -gt 400 ] && { tail -n 200 "$hist" > "$hist.tmp" && mv "$hist.tmp" "$hist"; }
     summarize "$DIR/$sid.json" | head -1
     ;;
@@ -423,7 +441,10 @@ case "${1:-}" in
     elif [ "$kind" = model ]; then
       echo "typed '$cmd'. After this turn Claude Code shows a 'Switch model?' dialog (the prompt cache is dropped, so the next reply re-reads the whole history and costs more); the USER must confirm it with Enter. Your default model in settings.json is left unchanged."
     else
-      echo "typed '$cmd'; it takes effect once the current turn ends and keeps the prompt cache. Your default effort in settings.json is left unchanged."
+      ef=$(f=$(panefile); { [ -n "$f" ] && [ -f "$f" ]; } || f=$(latest); [ -n "$f" ] && summarize "$f" state | jq -r '.effkeeps // false')
+      if [ "$ef" = true ]; then ecache="it keeps the prompt cache"
+      else ecache="on this setup it may drop the prompt cache (the next reply re-reads the history)"; fi
+      echo "typed '$cmd'; it takes effect once the current turn ends and $ecache. Your default effort in settings.json is left unchanged."
     fi
     ;;
   compact)

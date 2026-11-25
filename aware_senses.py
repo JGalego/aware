@@ -158,7 +158,8 @@ def read_hist(sid):
             for line in fh:
                 p = line.split()
                 if len(p) >= 2:
-                    rows.append((float(p[0]), float(p[1])))
+                    # third column (cache misses so far) is absent in older history files
+                    rows.append((float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else None))
     except (OSError, ValueError):
         pass
     return rows
@@ -209,6 +210,14 @@ def effects(sid):
         b, a = sum(before) / len(before), sum(after) / len(after)
         pct = (a - b) / b * 100 if b else 0
         verdict = "" if pct <= -10 else "; no clear drop yet"
+        if cmd == "/effort":
+            # An effort change should keep the prompt cache. If the cache-miss counter rose right after it,
+            # say so: on this setup the change was not free.
+            seen = [(t, m) for t, _, m in rows if m is not None]
+            pre = [m for t, m in seen if t <= ts]
+            post = [m for t, m in seen if ts < t <= ts + 120]
+            if pre and post and max(post) > pre[-1]:
+                verdict += "; cache misses rose by %d right after it, so here an effort change is not free" % (max(post) - pre[-1])
         text = "effect of %s: cost per turn $%.2f -> $%.2f (%+.0f%%, %d turns before, %d after)%s" % (
             (cmd + " " + arg).strip(), b, a, pct, len(before), len(after), verdict)
         out.append(text)

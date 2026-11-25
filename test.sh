@@ -66,6 +66,31 @@ check "reset soon but 7d still high: downgrade" '[[ "$v" == *"set_effort low"* &
 check "lean leaves effort high alone"          '[[ "$(view n3 40 10 10 14400 500000 true)" != *set_effort* ]]'
 check "lean steps xhigh down to high"          '[[ "$(fx n12 60 10 10 3600 500000 true | jq -c ".effort.level=\"xhigh\"" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"call set_effort high now"* ]]'
 check "critical on sonnet -> haiku"            '[[ "$(fx n13 97 10 10 3600 500000 true | jq -c ".model.id=\"claude-sonnet-5-5\"" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"set_effort low"*"set_model haiku"* ]]'
+
+echo "effort and the cache"
+# em <sid> <model id> [ENV=val ...]: conserve-tier advice for that model (cache warm unless WARM=false is passed first)
+em() { local sid=$1 mid=$2; shift 2
+  fx "$sid" 85 10 10 3600 500000 true | jq -c ".model.id=\"$mid\"" | "$A" statusline >/dev/null
+  env -u TMUX_PANE "$@" "$A" show; }
+KEEPS='call set_effort medium now (currently high; effort changes keep the cache)'
+DROPS='at the next natural break call set_effort medium (currently high; on this setup an effort change drops the prompt cache and re-reads ~118k tokens uncached)'
+for m in claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 claude-fable-5-2 claude-fable-5-1 claude-opus-5-6; do
+  check "$m: effort change keeps the cache" '[[ "$(em ec1 $m)" == *"$KEEPS"* ]]'
+done
+for m in claude-opus-4-8 claude-sonnet-4-5-20250929 claude-fable-5-0 claude-sonnet-5-4 claude-opus-5 mystery-model; do
+  check "$m: effort change drops it, so wait for a break" '[[ "$(em ec2 $m)" == *"$DROPS"* && "$(em ec2 $m)" != *"set_effort medium now"* ]]'
+done
+check "Bedrock: effort change drops the cache"    '[[ "$(em ec3 claude-opus-5-5 CLAUDE_CODE_USE_BEDROCK=1)" == *"$DROPS"* ]]'
+check "Vertex: effort change drops the cache"     '[[ "$(em ec3 claude-opus-5-5 CLAUDE_CODE_USE_VERTEX=1)" == *"$DROPS"* ]]'
+check "gateway URL: effort change drops the cache" '[[ "$(em ec3 claude-opus-5-5 ANTHROPIC_BASE_URL=https://gw.example.com/v1)" == *"$DROPS"* ]]'
+check "api.anthropic.com URL: still keeps"        '[[ "$(em ec3 claude-opus-5-5 ANTHROPIC_BASE_URL=https://api.anthropic.com/)" == *"$KEEPS"* ]]'
+check "AWARE_EFFORT_CACHE=yes overrides"          '[[ "$(em ec4 claude-opus-4-8 AWARE_EFFORT_CACHE=yes)" == *"$KEEPS"* ]]'
+check "AWARE_EFFORT_CACHE=no overrides"           '[[ "$(em ec4 claude-opus-5-5 AWARE_EFFORT_CACHE=no)" == *"$DROPS"* ]]'
+fx ec5 85 10 10 3600 500000 false | jq -c '.model.id="claude-opus-4-8"' | "$A" statusline >/dev/null
+check "cold cache: the wait advice says it is free" '[[ "$(env -u TMUX_PANE "$A" show)" == *"set_effort medium (currently high; on this setup an effort change drops the prompt cache and costs nothing extra now: the cache is cold)"* ]]'
+check "state: effkeeps true on a 5.5 model"       '[ "$(em ec6 claude-opus-5-5 >/dev/null; env -u TMUX_PANE "$A" show --json | jq .effkeeps)" = true ]'
+check "state: effkeeps false on an older model"   '[ "$(em ec6 claude-opus-4-8 >/dev/null; env -u TMUX_PANE "$A" show --json | jq .effkeeps)" = false ]'
+check "state: rules still target medium either way" '[ "$(env -u TMUX_PANE "$A" show --json | jq -r .rules.effort)" = medium ]'
 check "nothing cached yet -> switch is free"   '[[ "$(fx n14 85 10 10 3600 500000 true | jq -c ".prompt_cache.recache_tokens_if_cold=0" | "$A" statusline >/dev/null; env -u TMUX_PANE "$A" show)" == *"nothing is cached yet"* ]]'
 # AWARE_MODELS (cheapest to most expensive) drives both the step-down chain and the delegation hint
 vm() { fx "$1" "$2" 10 "$3" 3600 500000 true | jq -c ".model.id=\"$4\"" | "$A" statusline >/dev/null; AWARE_MODELS="$5" env -u TMUX_PANE "$A" show; }
@@ -203,6 +228,9 @@ check "decider down: hook still gives the rules advice" '[[ "$(hkd hq6 AWARE_DEC
 dstate hq7 20 10 high claude-opus-5-5
 ans high 0.99 opus 0.99 0.1
 check "normal tier + nothing to change: silent line" '[[ "$(hkd hq7 AWARE_DECIDER_URL="$URL" AWARE_DECIDER_MODE=advise | wc -l)" = 1 ]]'
+ans low 0.9 haiku 0.9 0.2
+dstate hq8 85 20 high claude-opus-5-5
+check "advise mode: decider effort waits for a break where it drops the cache" '[[ "$(hkd hq8 AWARE_DECIDER_URL="$URL" AWARE_DECIDER_MODE=advise CLAUDE_CODE_USE_BEDROCK=1)" == *"(decider): at the next natural break call set_effort low (on this setup it drops the prompt cache)"* ]]'
 
 echo "switch: validation"
 for v in "haiku; rm -rf ~" $'haiku\nrm' "fable" "" "../x" '$(id)'; do
@@ -238,6 +266,10 @@ echo '{"model":"sonnet","tui":"fullscreen"}' > "$HOME/.claude/settings.json"
 PATH="$T/shim:$PATH" TMUX_PANE=$live "$A" switch model haiku >/dev/null; sim_save; sleep 3
 check "default restored to sonnet"  '[ "$(jq -r .model "$HOME/.claude/settings.json")" = sonnet ]'
 check "other keys untouched"        '[ "$(jq -r .tui "$HOME/.claude/settings.json")" = fullscreen ]'
+fx sw1 85 10 10 3600 500000 true | TMUX_PANE=$live "$A" statusline >/dev/null
+check "switch effort: says it keeps the cache on a 5.5 model" '[[ "$(PATH="$T/shim:$PATH" TMUX_PANE=$live "$A" switch effort medium)" == *"it keeps the prompt cache"* ]]'
+fx sw1 85 10 10 3600 500000 true | jq -c '.model.id="claude-opus-4-8"' | TMUX_PANE=$live "$A" statusline >/dev/null
+check "switch effort: does not promise it on an older model"  '[[ "$(PATH="$T/shim:$PATH" TMUX_PANE=$live "$A" switch effort medium)" == *"may drop the prompt cache"* ]]'
 echo '{"tui":"fullscreen"}' > "$HOME/.claude/settings.json"
 PATH="$T/shim:$PATH" TMUX_PANE=$live "$A" switch model opus >/dev/null; sleep 0.3; jq '.model="opus"' "$HOME/.claude/settings.json" > "$T/s.tmp" && mv "$T/s.tmp" "$HOME/.claude/settings.json"; sleep 3
 check "no-default case: key removed again" '[ "$(jq "has(\"model\")" "$HOME/.claude/settings.json")" = false ]'
@@ -249,6 +281,7 @@ echo '{"model":"sonnet","tui":"fullscreen"}' > "$HOME/.claude/settings.json"
 echo "switch effort: user's default effort is preserved"
 eff_save() { sleep 1.2; jq ".modelSettings[\"claude-opus-5-5\"].effortLevel=\"$1\"" "$HOME/.claude/settings.json" > "$T/s.tmp" && mv "$T/s.tmp" "$HOME/.claude/settings.json"; }  # what /effort does (2.1.328)
 echo '{"modelSettings":{"claude-opus-5-5":{"effortLevel":"high"},"claude-haiku-5-5":{"effortLevel":"low"}},"tui":"fullscreen"}' > "$HOME/.claude/settings.json"
+fx sw2 85 10 10 3600 500000 true | TMUX_PANE=$live "$A" statusline >/dev/null
 check "effort result mentions the cache is kept" '[[ "$(PATH="$T/shim:$PATH" TMUX_PANE=$live "$A" switch effort medium)" == *"keeps the prompt cache"* ]]'
 eff_save medium; sleep 2
 check "effort default restored to high"  '[ "$(jq -r ".modelSettings[\"claude-opus-5-5\"].effortLevel" "$HOME/.claude/settings.json")" = high ]'
@@ -426,6 +459,20 @@ check "effect: model switch skips rebuild turn" '[[ "$v" == *"effect of /model s
 printf '%s /effort low pane=%%7\n' "$(ts $((now_t-1000+135)))" >> "$HOME/.claude/aware/switches.log"
 fb_old=$(echo '{"session_id":"fb1"}' | TMUX_PANE=%9 "$A" hook)
 check "effect: other panes are not mixed in"   '[[ "$fb_old" != *effect* ]]'
+withmiss() { # withmiss SID MOVE_TS PRE POST: add a cache-miss column to a two-column history
+  local f="$HOME/.claude/aware/$1.hist"; awk -v mv="$2" -v pre="$3" -v post="$4" 'NF==2{print $0, ($1>mv)?post:pre; next}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; }
+: > "$HOME/.claude/aware/switches.log"
+fb $((now_t-1000)) fb4 "/effort medium" 10; withmiss fb4 $((now_t-1000+135)) 2 3
+v=$(echo '{"session_id":"fb4"}' | TMUX_PANE=%7 "$A" hook)
+check "effect: cache misses after /effort are called out" '[[ "$v" == *"effect of /effort medium"*"cache misses rose by 1 right after it, so here an effort change is not free"* ]]'
+: > "$HOME/.claude/aware/switches.log"
+fb $((now_t-1000)) fb5 "/effort medium" 10; withmiss fb5 $((now_t-1000+135)) 2 2
+v=$(echo '{"session_id":"fb5"}' | TMUX_PANE=%7 "$A" hook)
+check "effect: no misses, no cache remark"     '[[ "$v" == *"effect of /effort medium"* && "$v" != *"cache misses"* ]]'
+: > "$HOME/.claude/aware/switches.log"
+fb $((now_t-1000)) fb6 "/model sonnet" 10; withmiss fb6 $((now_t-1000+135)) 2 3
+v=$(echo '{"session_id":"fb6"}' | TMUX_PANE=%7 "$A" hook)
+check "effect: a model switch is expected to miss, not flagged" '[[ "$v" == *"effect of /model sonnet"* && "$v" != *"cache misses"* ]]'
 
 echo "watch (live dashboard)"
 view n9 30 10 75 3600 500000 true >/dev/null

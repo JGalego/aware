@@ -15,7 +15,7 @@
 
 </div>
 
-Aware makes Claude Code sessions usage-aware, with live model and effort controls. Claude Code normally can't see how much of your 5-hour and 7-day plan it has burned, or how full its context is. Aware shows it, along with how fast it's spending, and tells it what to do about it: delegate bulk work to cheaper-model subagents, lower effort, switch model or compact at a natural break. Claude makes those changes itself, and nothing global is touched.
+Aware lets Claude Code act on its own usage. Claude Code normally can't see how much of your 5-hour and 7-day plan it has burned, or how full its context is. Aware shows it, along with how fast it's spending, and tells it exactly what to do about it: delegate bulk work to cheaper-model subagents, lower effort, switch model or compact at a natural break. Claude makes those changes itself, on its own session, and nothing global is touched. Showing the numbers is the easy part and others do it too; the point here is the acting, under a policy that knows what each move does to the prompt cache.
 
 <div align="center">
   <img alt="aware demo: a live dashboard beside Claude shows the context climbing from normal to conserve; Claude lowers its own effort and compacts, and the tier drops back to normal" src="docs/demo.gif" width="100%">
@@ -110,7 +110,7 @@ The MCP server sends the policy once, at `initialize`, and marks its tools `alwa
 
 1. Delegate bulk work to cheaper-model subagents and match the model to the task: the cheapest (`haiku`) for mechanical work like search, reads and summaries, the middle one (`sonnet`) where judgment is needed, and the hardest reasoning stays in the main session. Only their short report enters the context; if a result looks thin, step up a model.
 2. Keep reads and replies small.
-3. Use effort as the main knob: it keeps the prompt cache (verified live).
+3. Use effort as the main knob. On Fable 5.1+ and Opus/Sonnet/Haiku 5.5+ with an API key or subscription it keeps the prompt cache (verified live on Opus 5.5). On older models, Bedrock/Vertex/Foundry or a gateway it does not, so there aware says "at the next natural break" instead of "now", and quotes the re-read cost like it does for a model switch (`AWARE_EFFORT_CACHE` overrides the detection). If the cache-miss counter rises right after a `/effort`, the effect line says so.
 4. Switch model only at a natural break with substantial work left. A switch re-reads the whole context uncached, so it is cheapest when context is small (early on, or right after `compact`) or the cache is already cold. The advice quotes the actual cost (`recache_tokens_if_cold`).
 5. `compact` at a natural break when context is high, after writing down the goal and next steps.
 
@@ -194,6 +194,7 @@ It is asked three questions, only when the tier, model, effort or a 10% usage ba
 | `AWARE_DECIDER_UP_CONF` | `0.85` | Confidence needed to advise a costlier model or effort above tier `normal` (at `normal`, `AWARE_DECIDER_MIN_CONF` applies). |
 | `AWARE_DECIDER_TIMEOUT` | `2` | Seconds to wait for the decider before using the rules. |
 | `AWARE_DECIDER_PROMPT` | `0` | Set to `1` to also send your latest prompt (first 300 characters). |
+| `AWARE_EFFORT_CACHE` | `auto` | Whether an effort change keeps the prompt cache. `auto` = yes only on Fable 5.1+ and Opus/Sonnet/Haiku 5.5+, and not when `CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY` or a non-Anthropic `ANTHROPIC_BASE_URL` is set. `yes` / `no` force it. |
 | `AWARE_KEEP_DEFAULT` | `1` | Restore your previous default model/effort in `settings.json` after a switch; `0` leaves the new default in place. |
 | `AWARE_AUTOCONFIRM` | `0` | Set to `1` to automatically confirm a switch dialog naming the requested model. |
 | `AWARE_CONFIRM_WAIT` | `600` | Maximum seconds to wait for the matching model-switch dialog when auto-confirm is enabled. |
@@ -218,7 +219,7 @@ Run the tests with `./test.sh`. They use a fake `HOME`, a private tmux server an
 - The `--settings` statusline and hook and the `--mcp-config` tools load, and the hook's usage line reaches the model's context. A project-level hook and aware's hook both fire.
 - The MCP `instructions` reach the model; with `alwaysLoad` the tools are in the prompt, not deferred.
 - The hook injects once, then stays silent while nothing changes. The first prompt sees borrowed account-wide limits.
-- `set_effort` applies after the turn ends and keeps the prompt cache (0 misses across the change). Since 2.1.328 `/effort` saves to `modelSettings.<model>.effortLevel` in `settings.json`; aware restores it.
+- `set_effort` applies after the turn ends and keeps the prompt cache (0 misses across the change; Opus 5.5 on a subscription, not re-checked on other models or providers). Since 2.1.328 `/effort` saves to `modelSettings.<model>.effortLevel` in `settings.json`; aware restores it.
 - `compact` runs `/compact` after the turn ends; context dropped to 0% and the model wrote down the goal first.
 - At a (simulated) 88% 5h usage, the model called `set_effort medium` first, as the advice named it, then answered with one grep and one ranged read. With the tools deferred, or with the advice worded vaguely, it ignored the advice.
 - `set_model` applies live. Claude Code shows a "Switch model?" dialog (the prompt cache is dropped) and `/model` saves the choice as your default; aware restores your previous default.
@@ -228,7 +229,9 @@ Run the tests with `./test.sh`. They use a fake `HOME`, a private tmux server an
 
 - 5h/7d numbers only exist for Pro/Max/Ultra subscribers, after the first response.
 - Typing into the pane can interleave with text you are typing at that moment.
-- Model switching is not free (cache drop), so it only pays off for long remaining work; effort changes are the cheap lever.
+- Model switching is not free (cache drop), so it only pays off for long remaining work; effort changes are the cheap lever, but only where they keep the cache (see the policy). The model/provider detection is a guess from the model id and environment variables; use `AWARE_EFFORT_CACHE` if it is wrong for your setup.
+- Nobody has shown that injecting usage helps. A placebo-controlled study of coding agents ([arXiv:2611.21614](https://arxiv.org/abs/2611.21614), open models only) found that telling the agent its budget did no better than an unrelated sentence; the gains came from enforced limits. Aware is untested against that: its bet is that concrete advice plus tools to act on it is different from disclosure, and it has no controlled evaluation yet.
+- The usage numbers are account-wide (shared by every session on the plan); cost and context are per session. A subagent does not see aware's readout.
 - Whether the model follows the advice is up to the model. It did when the advice named an exact call and the numbers backed it up; with low numbers and a forced tier it ignored even that.
 - Stuck detection is a heuristic on tool calls (identical call and result, or many edits to one file). It cannot tell polling from looping when the output happens to repeat, so it only says "stuck?" and leaves the decision to Claude.
 - The measured effect of a switch compares cost per turn over a few turns on each side. Turns differ in size, so treat it as a hint, not a benchmark.
