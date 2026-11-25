@@ -42,11 +42,12 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .gh .i { font-size: 18px; }
 
 /* hero */
-.hero { text-align: center; padding: 56px 0 36px; }
-h1 { margin: 0 auto; font-size: clamp(30px, 4.6vw, 50px); line-height: 1.04; letter-spacing: -.03em; font-weight: 700; text-wrap: balance; }
-h1 .l { display: block; white-space: nowrap; }
+.top { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 48px; align-items: center; padding: 24px 0 0; }
+.hero { text-align: left; }
+.eyebrow { margin: 0 0 18px; font: 600 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+h1 { margin: 0; white-space: nowrap; font-size: clamp(30px, 3vw, 42px); line-height: 1.06; letter-spacing: -.03em; font-weight: 700; }
 h1 em { font-style: normal; color: var(--accent); }
-.cta { display: flex; gap: 12px; justify-content: center; margin-top: 32px; flex-wrap: wrap; }
+.cta { display: flex; gap: 12px; margin-top: 30px; flex-wrap: wrap; }
 .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 10px; font-weight: 600; font-size: 15px; border: 1px solid var(--line); transition: transform .15s, background .15s, border-color .15s; }
 .btn:hover { transform: translateY(-1px); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #1a0f0a; }
@@ -54,7 +55,7 @@ h1 em { font-style: normal; color: var(--accent); }
 .btn.ghost:hover { background: var(--panel); border-color: #484f58; }
 .btn .i, .btn .s { font-size: 17px; }
 
-.frame { margin: 8px auto 0; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: #0d1117;
+.frame { margin: 0; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: #0d1117;
   box-shadow: 0 30px 80px -30px #000, 0 0 0 1px #ffffff08, 0 0 120px -40px #d9775766; }
 .frame video { width: 100%; height: auto; display: block; }
 
@@ -147,10 +148,12 @@ footer { margin-top: 96px; padding: 28px 0 44px; border-top: 1px solid var(--lin
 footer a:hover { color: var(--text); }
 footer nav { display: flex; gap: 20px; }
 
+@media (max-width: 900px) {
+  .top { grid-template-columns: 1fr; gap: 32px; padding-top: 8px; }
+  .hero { text-align: center; }
+  .cta { justify-content: center; }
+}
 @media (max-width: 760px) {
-  h1 { font-size: clamp(32px, 9vw, 44px); max-width: 16ch; }
-  h1 .l { display: inline; white-space: normal; }
-  .hero { padding-top: 32px; }
   section { padding-top: 64px; }
   .card { padding: 18px; }
   .cols { grid-template-columns: 1fr; }
@@ -186,16 +189,19 @@ footer nav { display: flex; gap: 20px; }
   </header>
 
   <main id="top">
-    <div class="hero">
-      <h1><span class="l">Claude Code that knows its limits,</span> <span class="l">and <em>acts on them.</em></span></h1>
-      <div class="cta">
-        <a class="btn primary" href="#install"><svg class="s" viewBox="0 0 24 24"><path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/></svg>Install</a>
-        <a class="btn ghost" href="https://github.com/JGalego/aware"><svg class="i"><use href="#github"/></svg>Source</a>
+    <div class="top">
+      <div class="hero">
+        <p class="eyebrow">Claude Code</p>
+        <h1>Knows its limits.<br><em>Acts on them.</em></h1>
+        <div class="cta">
+          <a class="btn primary" href="#install"><svg class="s" viewBox="0 0 24 24"><path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/></svg>Install</a>
+          <a class="btn ghost" href="https://github.com/JGalego/aware"><svg class="i"><use href="#github"/></svg>Source</a>
+        </div>
       </div>
-    </div>
 
-    <div class="frame">
-      <video src="demo.mp4" poster="demo-poster.png" autoplay muted loop playsinline preload="metadata" aria-label="A live dashboard beside Claude Code: the context fills, the tier climbs to conserve, Claude lowers its own effort and compacts, and the tier drops back to normal."></video>
+      <div class="frame">
+        <video src="demo.mp4" poster="demo-poster.png" autoplay muted loop playsinline preload="metadata" aria-label="A live dashboard beside Claude Code: the context fills, the tier climbs to conserve, Claude lowers its own effort and compacts, and the tier drops back to normal."></video>
+      </div>
     </div>
 
     <section id="try">
